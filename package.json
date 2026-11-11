@@ -1,0 +1,18 @@
+{
+  "name": "keyturn",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Two-person rule for software releases, enforced on NEAR",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test:mock": "node --test mock/registry.test.mjs",
+    "test:contract": "cargo test --manifest-path contract/Cargo.toml",
+    "test:worker": "cargo test --manifest-path worker/Cargo.toml",
+    "build:worker": "cargo build --manifest-path worker/Cargo.toml",
+    "mock": "node mock/registry.mjs"
+  }
+}

@@ -26,17 +26,22 @@ npm's staged publishing adds a 2FA step, but any one maintainer can approve alon
 Layout:
 
 ```
-contract/   NEAR smart contract (Rust)
+contract/   NEAR smart contract (Rust): quorum, public window, bonded flags, recall
+worker/     Stateless publisher (Rust, builds natively and for wasm32-wasip2)
+mock/       Local stand-in for npm's staged publishing API, for tests and demos
 ```
 
-More components (worker, CLI, mock registry, dashboard) are added as they are built.
+More components (CLI, dashboard) are added as they are built.
 
-## Run the contract tests
+## Run the tests
 
 ```
-cd contract
-cargo test
+npm run test:contract      # contract unit tests
+npm run test:worker        # worker unit tests
+npm run build:worker && npm run test:mock   # mock registry plus the real worker binary
 ```
+
+The mock tests start a local registry and run the compiled worker against it. They check that the worker publishes the approved bytes, refuses a tarball swapped after approval, and fails on a wrong one-time seed. A stage-only credential cannot approve on the mock, as with a trusted publishing identity on npm.
 
 ## Prior art
 
