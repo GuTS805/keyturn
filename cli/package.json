@@ -1,0 +1,19 @@
+{
+  "name": "keyturn-cli",
+  "version": "0.1.0",
+  "description": "Command line for Keyturn: propose, approve and verify releases",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "keyturn": "src/index.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "near-api-js": "^7.5.3"
+  }
+}

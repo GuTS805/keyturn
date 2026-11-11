@@ -13,6 +13,9 @@
     "test:contract": "cargo test --manifest-path contract/Cargo.toml",
     "test:worker": "cargo test --manifest-path worker/Cargo.toml",
     "build:worker": "cargo build --manifest-path worker/Cargo.toml",
-    "mock": "node mock/registry.mjs"
+    "mock": "node mock/registry.mjs",
+    "install:cli": "npm --prefix cli install",
+    "test:cli": "npm --prefix cli test",
+    "test": "npm run test:contract && npm run test:worker && npm run build:worker && npm run test:mock && npm run test:cli"
   }
 }

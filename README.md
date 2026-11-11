@@ -29,9 +29,20 @@ Layout:
 contract/   NEAR smart contract (Rust): quorum, public window, bonded flags, recall
 worker/     Stateless publisher (Rust, builds natively and for wasm32-wasip2)
 mock/       Local stand-in for npm's staged publishing API, for tests and demos
+cli/        `keyturn` command line (Node): propose, approve, flag, status, verify, relay
 ```
 
-More components (CLI, dashboard) are added as they are built.
+The dashboard is added as it is built.
+
+## CLI
+
+```
+npm run install:cli
+export KEYTURN_CONTRACT=<contract account>   KEYTURN_ACCOUNT=<your account>   KEYTURN_KEY=ed25519:...
+node cli/src/index.mjs help
+```
+
+Reads (`status`, `verify`) need no key. `verify npm:name@1.2.3` downloads what the registry serves, hashes it, and exits non-zero unless the contract says that exact hash was approved by the quorum and published. A recalled version fails too.
 
 ## Run the tests
 
@@ -39,6 +50,8 @@ More components (CLI, dashboard) are added as they are built.
 npm run test:contract      # contract unit tests
 npm run test:worker        # worker unit tests
 npm run build:worker && npm run test:mock   # mock registry plus the real worker binary
+npm run install:cli && npm run test:cli     # CLI logic, including relay with the real worker binary
+npm test                                    # all of the above
 ```
 
 The mock tests start a local registry and run the compiled worker against it. They check that the worker publishes the approved bytes, refuses a tarball swapped after approval, and fails on a wrong one-time seed. A stage-only credential cannot approve on the mock, as with a trusted publishing identity on npm.
