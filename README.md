@@ -56,6 +56,32 @@ npm test                                    # all of the above
 
 The mock tests start a local registry and run the compiled worker against it. They check that the worker publishes the approved bytes, refuses a tarball swapped after approval, and fails on a wrong one-time seed. A stage-only credential cannot approve on the mock, as with a trusted publishing identity on npm.
 
+## Live on testnet
+
+The contract is deployed at `contract.hudich-keyturn.testnet`. Reading needs no key:
+
+```
+npm run install:cli
+export KEYTURN_CONTRACT=contract.hudich-keyturn.testnet
+node cli/src/index.mjs status npm:demo-mwci8d1h@1.0.0     # a release from the demo run, now Recalled
+```
+
+## Full demo
+
+The demo registers a project on the testnet contract, stages packages on a local mock npm registry, and walks through the attack scenarios with the real contract and the real worker binary. Only the registry is mocked.
+
+```
+npm run install:cli && npm run build:worker && npm run build:contract
+# create a main testnet account with near CLI (save the key to the legacy keychain), then:
+cp .env.example .env        # set KEYTURN_MAIN_ACCOUNT
+npm run setup:testnet       # creates sub-accounts, deploys and initialises the contract
+npm run demo
+```
+
+What it checks, in order: a stage-only CI account cannot approve; one maintainer alone cannot release; execution is refused while the public window is open; after quorum and window the worker publishes and the contract records it; `verify` passes on the served bytes; a tarball swapped after approval is refused by the worker and never recorded; a quorum recall makes `verify` fail.
+
+Build note: `contract/.cargo/config.toml` sets `--cfg near` for the wasm target. Without it near-sdk-env compiles its local fallback, and panic messages never reach the chain.
+
 ## Prior art
 
 Google's Wombat Dressing Room (2020) is a central npm publish proxy that holds a 2FA bot account. It uses a single approval and its operator holds the secrets. Keyturn adds an approval quorum, a public window, and an onchain policy and audit log, and the credential is bound to one worker build.

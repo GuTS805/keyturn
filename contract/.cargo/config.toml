@@ -1,0 +1,5 @@
+# near-sdk-env only compiles the host-function paths (panic messages, hashing)
+# when `--cfg near` is set on wasm32. `cargo near build` sets this; plain
+# `cargo build` does not, so set it here for the wasm target only.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "near"]
