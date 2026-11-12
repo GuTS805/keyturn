@@ -222,7 +222,49 @@ fn registry_error(r: &Response) -> String {
     }
 }
 
+/// What the registry serves for a version, compared with the approved hash.
+enum Served {
+    /// The registry has no such version (yet).
+    Missing,
+    /// It serves exactly the approved bytes.
+    Matches(String),
+    /// It serves other bytes.
+    Different(String),
+    /// Something went wrong while looking.
+    Failed(String),
+}
+
+fn lookup_served(http: &dyn Http, base: &str, package: &str, version: &str, approved_hash: &str) -> Served {
+    let encoded = package.replacen('/', "%2f", 1);
+    let meta_url = format!("{}/{}/{}", base, encoded, version);
+    let meta = match http.get(&meta_url, &[]) {
+        Ok(r) if ok_status(&r) => r.body,
+        Ok(r) if r.status == 404 => return Served::Missing,
+        Ok(r) => return Served::Failed(format!("version lookup answered {}", r.status)),
+        Err(e) => return Served::Failed(e),
+    };
+    let href = serde_json::from_slice::<serde_json::Value>(&meta)
+        .ok()
+        .and_then(|v| v.pointer("/dist/tarball").and_then(|t| t.as_str()).map(str::to_string));
+    let Some(href) = href else {
+        return Served::Failed("published version has no tarball address".to_string());
+    };
+    let published = match http.get(&href, &[]) {
+        Ok(r) if ok_status(&r) => r.body,
+        Ok(r) => return Served::Failed(format!("tarball download answered {}", r.status)),
+        Err(e) => return Served::Failed(e),
+    };
+    let hash = sha256_hex(&published);
+    if hash == approved_hash {
+        Served::Matches(hash)
+    } else {
+        Served::Different(hash)
+    }
+}
+
 /// Look up the published version, download its tarball and compare the hash.
+/// A registry may accept an upload and show it later, so a missing version is
+/// retried, and reported as `pending` if it never shows up in time.
 fn verify_published(
     http: &dyn Http,
     base: &str,
@@ -232,51 +274,28 @@ fn verify_published(
     attempts: u32,
     delay_ms: u64,
 ) -> Output {
-    let encoded = package.replacen('/', "%2f", 1);
-    let meta_url = format!("{}/{}/{}", base, encoded, version);
     let mut last = Output::failure("post_check_failed", "no attempt was made");
     for attempt in 0..attempts.max(1) {
         if attempt > 0 && delay_ms > 0 {
             std::thread::sleep(Duration::from_millis(delay_ms));
         }
-        let meta = match http.get(&meta_url, &[]) {
-            Ok(r) if ok_status(&r) => r.body,
-            Ok(r) => {
-                last = Output::failure("post_check_failed", format!("version lookup answered {}", r.status));
-                continue;
+        match lookup_served(http, base, package, version, approved_hash) {
+            Served::Matches(hash) => return Output::success(hash),
+            // A different tarball is not a timing problem, so do not retry.
+            Served::Different(hash) => {
+                return Output::failure(
+                    "post_check_failed",
+                    format!("published tarball hash {} differs from the approved hash", hash),
+                )
             }
-            Err(e) => {
-                last = Output::failure("post_check_failed", e);
-                continue;
+            Served::Missing => {
+                last = Output::failure(
+                    "pending",
+                    "the registry accepted the upload but does not serve the version yet; send the same request again to confirm",
+                )
             }
-        };
-        let href = serde_json::from_slice::<serde_json::Value>(&meta)
-            .ok()
-            .and_then(|v| v.pointer("/dist/tarball").and_then(|t| t.as_str()).map(str::to_string));
-        let Some(href) = href else {
-            last = Output::failure("post_check_failed", "published version has no tarball address");
-            continue;
-        };
-        let published = match http.get(&href, &[]) {
-            Ok(r) if ok_status(&r) => r.body,
-            Ok(r) => {
-                last = Output::failure("post_check_failed", format!("tarball download answered {}", r.status));
-                continue;
-            }
-            Err(e) => {
-                last = Output::failure("post_check_failed", e);
-                continue;
-            }
-        };
-        let published_hash = sha256_hex(&published);
-        if published_hash == approved_hash {
-            return Output::success(published_hash);
+            Served::Failed(e) => last = Output::failure("post_check_failed", e),
         }
-        // A different tarball is not a timing problem, so do not retry.
-        return Output::failure(
-            "post_check_failed",
-            format!("published tarball hash {} differs from the approved hash", published_hash),
-        );
     }
     last
 }
@@ -426,6 +445,19 @@ pub fn run_publish(input: &PublishInput, secrets: &Secrets, registry: &str, http
         ("content-type", "application/json"),
         ("npm-command", "publish"),
     ];
+    // If the version is already there, this is a repeat of an earlier request, for
+    // example after a `pending` answer. Confirm it instead of publishing again.
+    match lookup_served(http, base, &input.package, &input.version, &input.approved_hash) {
+        Served::Matches(hash) => return Output::success(hash),
+        Served::Different(hash) => {
+            return Output::failure(
+                "version_exists",
+                format!("the registry already serves this version with other bytes (hash {})", hash),
+            )
+        }
+        Served::Missing | Served::Failed(_) => {}
+    }
+
     let put_note = match http.put(&url, &headers, &body) {
         Ok(r) if ok_status(&r) => {
             let text: String = String::from_utf8_lossy(&r.body).chars().take(200).collect();
@@ -704,7 +736,19 @@ mod tests {
         PublishOptions { allow_http_artifacts: false, post_check_attempts: 3, post_check_delay_ms: 0 }
     }
 
+    /// A registry that does not have the version until it is published.
     fn publish_registry(artifact: Vec<u8>, published: Vec<u8>) -> Fake {
+        let meta = format!(r#"{{"dist":{{"tarball":"{}/leftpad/-/leftpad-1.0.0.tgz"}}}}"#, REG);
+        Fake::default()
+            .route("PUBLIC", ART, 200, artifact)
+            .route("PUT", &format!("{}/leftpad", REG), 200, b"{\"ok\":true}".to_vec())
+            .route("GET", &format!("{}/leftpad/1.0.0", REG), 404, vec![])
+            .route("GET", &format!("{}/leftpad/1.0.0", REG), 200, meta.into_bytes())
+            .route("GET", &format!("{}/leftpad/-/leftpad-1.0.0.tgz", REG), 200, published)
+    }
+
+    /// A registry that already serves the version.
+    fn registry_already_has(artifact: Vec<u8>, published: Vec<u8>) -> Fake {
         let meta = format!(r#"{{"dist":{{"tarball":"{}/leftpad/-/leftpad-1.0.0.tgz"}}}}"#, REG);
         Fake::default()
             .route("PUBLIC", ART, 200, artifact)
@@ -752,6 +796,7 @@ mod tests {
         let http = Fake::default()
             .route("PUBLIC", ART, 200, bytes.clone())
             .route("PUT", &format!("{}/@acme%2futil", REG), 201, vec![])
+            .route("GET", &format!("{}/@acme%2futil/2.0.0", REG), 404, vec![])
             .route("GET", &format!("{}/@acme%2futil/2.0.0", REG), 200, meta.into_bytes())
             .route("GET", &format!("{}/dl.tgz", REG), 200, bytes.clone());
         let mut i = pinput(&hash);
@@ -836,7 +881,28 @@ mod tests {
         let hash = sha256_hex(&bytes);
         let http = publish_registry(bytes.clone(), bytes).replace("GET", &format!("{}/leftpad/1.0.0", REG), 404, vec![]);
         let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
-        assert_eq!(out.error.as_deref(), Some("post_check_failed"));
+        assert_eq!(out.error.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn a_repeated_request_confirms_without_publishing_again() {
+        let bytes = tgz("leftpad", "1.0.0", "x");
+        let hash = sha256_hex(&bytes);
+        let http = registry_already_has(bytes.clone(), bytes);
+        let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
+        assert_eq!(out, Output::success(hash));
+        assert_eq!(http.count("PUT"), 0, "nothing is published twice");
+    }
+
+    #[test]
+    fn an_existing_version_with_other_bytes_is_never_overwritten() {
+        let bytes = tgz("leftpad", "1.0.0", "x");
+        let other = tgz("leftpad", "1.0.0", "y");
+        let hash = sha256_hex(&bytes);
+        let http = registry_already_has(bytes, other);
+        let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
+        assert_eq!(out.error.as_deref(), Some("version_exists"));
+        assert_eq!(http.count("PUT"), 0);
     }
 
     #[test]
@@ -847,7 +913,7 @@ mod tests {
         let http = publish_registry(bytes, other);
         let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
         assert_eq!(out.error.as_deref(), Some("post_check_failed"));
-        assert_eq!(http.count("GET"), 2, "a different tarball is not retried");
+        assert_eq!(http.count("GET"), 3, "one look before publishing, then the version and the tarball once");
     }
 
     #[test]

@@ -173,7 +173,7 @@ export function runWorkerBinary(bin, env = {}, args = []) {
  * and reports the published hash back as the worker account. With OutLayer this
  * step is replaced by the yield/resume callback.
  */
-export async function relay(chain, { project, version, stageId, artifactUrl, runWorker }) {
+export async function relay(chain, { project, version, stageId, artifactUrl, runWorker, pendingRetries = 0, pendingDelayMs = 15000 }) {
   const { registry, name } = splitProject(project);
   if (registry === 'chrome' && !artifactUrl) throw new Error('chrome projects need --artifact-url');
   if (!artifactUrl && !stageId) throw new Error('give --artifact-url (publish) or --stage-id (staged approve)');
@@ -185,7 +185,13 @@ export async function relay(chain, { project, version, stageId, artifactUrl, run
   const request = artifactUrl
     ? { mode: registry === 'chrome' ? 'chrome' : 'publish', package: name, version, approved_hash: release.artifact_hash, artifact_url: artifactUrl }
     : { mode: 'stage_approve', stage_id: stageId, package: name, version, approved_hash: release.artifact_hash };
-  const result = await runWorker(request);
+  let result = await runWorker(request);
+  // A registry may accept an upload and show it minutes later. The worker answers "pending"
+  // and is safe to ask again: it confirms what is there and never publishes twice.
+  for (let i = 0; !result.ok && result.error === 'pending' && i < pendingRetries; i++) {
+    await new Promise((r) => setTimeout(r, pendingDelayMs));
+    result = await runWorker(request);
+  }
   if (!result.ok) return { confirmed: false, result };
   await chain.call('confirm_published', {
     project_id: project,

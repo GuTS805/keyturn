@@ -23,6 +23,7 @@
     "demo": "node --env-file=.env cli/scripts/demo.mjs",
     "demo:local": "node cli/scripts/demo.mjs --local",
     "demo:chrome": "node cli/scripts/demo-chrome.mjs",
+    "demo:real": "node --env-file=.env cli/scripts/demo-real.mjs",
     "npm:live": "node --env-file=.env cli/scripts/npm-live.mjs"
   }
 }
