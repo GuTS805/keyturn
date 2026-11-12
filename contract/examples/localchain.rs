@@ -89,6 +89,31 @@ fn dispatch(c: &mut Keyturn, method: &str, a: &Value) -> Value {
             c.recall_release(p(), v());
             Value::Null
         }
+        "propose_guardians" => {
+            let guardians: Vec<AccountId> = serde_json::from_value(a["guardians"].clone()).expect("guardians is a list of accounts");
+            c.propose_guardians(p(), guardians, a["threshold"].as_u64().expect("threshold is a number") as u8);
+            Value::Null
+        }
+        "start_recovery" => {
+            let members: Vec<AccountId> = serde_json::from_value(a["new_members"].clone()).expect("new_members is a list of accounts");
+            c.start_recovery(p(), members, a["new_threshold"].as_u64().expect("new_threshold is a number") as u8);
+            Value::Null
+        }
+        "approve_recovery" => {
+            c.approve_recovery(p());
+            Value::Null
+        }
+        "cancel_recovery" => {
+            c.cancel_recovery(p());
+            Value::Null
+        }
+        "finish_recovery" => {
+            c.finish_recovery(p());
+            Value::Null
+        }
+        "get_guardians" => serde_json::to_value(c.get_guardians(p())).unwrap(),
+        "get_guardian_proposal" => serde_json::to_value(c.get_guardian_proposal(p())).unwrap(),
+        "get_recovery" => serde_json::to_value(c.get_recovery(p())).unwrap(),
         "get_worker" => json!(c.get_worker()),
         "get_project" => serde_json::to_value(c.get_project(p())).unwrap(),
         "get_release" => serde_json::to_value(c.get_release(p(), v())).unwrap(),

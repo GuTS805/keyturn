@@ -109,6 +109,12 @@ The worker has two modes for npm. Both only act on the hash the quorum approved.
 
 The registry address is read from the operator's environment, never from the request, so a requester cannot make the worker send its token elsewhere. Artifact URLs must be `https` and must not contain credentials.
 
+## Break-glass recovery
+
+If maintainers lose their keys, a project must not be stuck forever, and a stolen key must not be able to take it over either. A project can name guardians in advance, accounts that are not members. The members' quorum has to propose the same guardians for them to take effect (`keyturn guardians`). Later, if keys are lost, the guardians' threshold can start a recovery that replaces the member list (`keyturn recovery start|approve|status`). It waits seven days in public. Any current member can cancel it during that time (`keyturn recovery cancel`), and anyone can finish it afterwards (`keyturn recovery finish`). Approvals given by members who were removed stop counting for releases that were still waiting.
+
+The wait is seven days, so the demo shows this on the simulated clock (`npm run demo:local`, step 8). It is tested in the contract unit tests and over the local chain. Limits are in [THREAT_MODEL.md](THREAT_MODEL.md).
+
 ## Chrome Web Store
 
 The worker has a `chrome` mode. The quorum approves the SHA-256 of an extension ZIP. After the window the worker downloads the ZIP, checks the hash and the `manifest.json` version, wraps it in a CRX3 file signed with an RSA key that only the worker holds, uploads it through the Chrome Web Store API v2 and requests publication. CI holds neither the signing key nor any store credential.

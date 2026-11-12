@@ -138,6 +138,27 @@ try {
   check((await statusOf('1.0.0')) === 'Recalled', 'release is Recalled');
   const recalled = await cmd.verify(chain.ada, { project, version: '1.0.0', registryUrl: reg.url });
   check(!recalled.ok, `verify now fails: ${recalled.reason}`);
+
+  if (local) {
+    // The wait is seven days, so this part only runs on the simulated clock.
+    step('8. Break-glass: guardians recover a project, a live member can veto');
+    const g = { g1: net.as('g1.local'), g2: net.as('g2.local') };
+    await cmd.proposeGuardians(chain.ada, { project, guardians: 'g1.local,g2.local,g3.local', threshold: 2 });
+    await cmd.proposeGuardians(chain.bob, { project, guardians: 'g1.local,g2.local,g3.local', threshold: 2 });
+    say('two members named three guardians (2 of 3)');
+    await expectRefused(cmd.startRecovery(chain.ada, { project, members: 'x.local,y.local', threshold: 2 }), 'a member cannot start a recovery');
+    await cmd.startRecovery(g.g1, { project, members: 'x.local,y.local', threshold: 2 });
+    await cmd.approveRecovery(g.g2, { project });
+    await cmd.cancelRecovery(chain.cy, { project });
+    check(!(await chain.ada.view('get_recovery', { project_id: project })), 'a hostile recovery is vetoed by one live member');
+    await cmd.startRecovery(g.g1, { project, members: 'dan.local,eve.local', threshold: 2 });
+    await cmd.approveRecovery(g.g2, { project });
+    await expectRefused(cmd.finishRecovery(chain.watch, { project }), 'the recovery cannot finish early');
+    net.advance(7 * 24 * 3600 * 1000 + 1000);
+    await cmd.finishRecovery(chain.watch, { project });
+    const after = await chain.ada.view('get_project', { project_id: project });
+    check(after.members.join() === 'dan.local,eve.local', 'after seven public days the members are replaced');
+  }
 } finally {
   await reg.close();
   if (net) net.close();

@@ -28,6 +28,12 @@ Commands:
   relay     <project>@<version> --artifact-url URL --worker path/to/keyturn-worker   (local mode, direct publish)
             <project>@<version> --stage-id UUID --worker path/to/keyturn-worker      (local mode, staged approve)
             chrome:<extension id>@<version> --artifact-url URL --worker ...          (local mode, Chrome Web Store)
+  guardians  --project P --guardians a,b,c --threshold 2   member proposes recovery guardians (the members' threshold must propose the same)
+  recovery   start   --project P --members a,b --threshold 2    guardian: ask to replace the members
+             approve --project P                                guardian: approve; at the threshold a 7 day public wait starts
+             cancel  --project P                                member: veto
+             finish  --project P                                anyone: after the wait
+             status  --project P
   hash      <file>
 `;
 
@@ -43,6 +49,7 @@ const options = {
   threshold: { type: 'string' },
   'window-hours': { type: 'string' },
   tarball: { type: 'string' },
+  guardians: { type: 'string' },
   reason: { type: 'string' },
   bond: { type: 'string' },
   'stage-id': { type: 'string' },
@@ -85,6 +92,27 @@ async function main() {
       windowHours: v['window-hours'],
     });
     return console.log(`registered ${v.project}`);
+  }
+
+  if (command === 'guardians') {
+    if (!v.project || !v.guardians || !v.threshold) fail('guardians needs --project, --guardians and --threshold');
+    await cmd.proposeGuardians(chain, { project: v.project, guardians: v.guardians, threshold: v.threshold });
+    return console.log(`proposed guardians for ${v.project}`);
+  }
+  if (command === 'recovery') {
+    const sub = target;
+    if (!v.project) fail('recovery needs --project');
+    if (sub === 'start') {
+      if (!v.members || !v.threshold) fail('recovery start needs --members and --threshold');
+      await cmd.startRecovery(chain, { project: v.project, members: v.members, threshold: v.threshold });
+      return console.log('recovery started');
+    }
+    if (sub === 'approve' || sub === 'cancel' || sub === 'finish') {
+      await cmd[sub + 'Recovery'](chain, { project: v.project });
+      return console.log(`recovery ${sub}: ok`);
+    }
+    if (sub === 'status') return console.log(await cmd.recoveryStatus(chain, { project: v.project }));
+    fail('recovery needs start, approve, cancel, finish or status');
   }
 
   if (!target) fail(`${command} needs <project>@<version>`);

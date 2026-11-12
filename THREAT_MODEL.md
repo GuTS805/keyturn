@@ -28,6 +28,7 @@ The worker is the weakest link, so it is kept small and stateless. In production
 | A watcher spots a bad release during the window | Anyone can flag with a 0.1 NEAR bond, which blocks execution until the members dismiss or reject | contract tests |
 | A bad release is already out | The quorum can recall it. `verify` then fails for that version | demo step 7 |
 | Signing for someone else's Chrome extension | The extension id is derived from the signing key. The worker refuses a request that names another id (`key_mismatch`) | worker tests, Chrome tests |
+| Keys are lost and the project is stuck | Guardians start a recovery, which waits seven days in public and can be vetoed by any live member. After it, only the new members' approvals count | contract tests, demo step 8 (local clock) |
 | Anyone but the worker records a publication | `confirm_published` accepts only the worker account, and only with the approved hash | contract tests |
 | Secrets leaking in logs or outputs | Outputs never include tokens, secrets or keys. Registry error text is cut. Output is limited to 900 bytes | worker tests |
 
@@ -41,6 +42,7 @@ These are real gaps. Do not rely on Keyturn for them.
 - **The registry account itself.** The credential held by the worker can publish. If another route to that account exists (a recovery email, a second token, a login), the quorum can be bypassed. The package must be locked down so that the worker's token is the only way in. For npm that is a manual setting, and Keyturn cannot check it.
 - **npm's end of direct publishing.** npm will remove direct publishing with 2FA-bypass tokens in January 2027. The direct mode has that end date. The staged-approve mode depends on an authenticator app that new npm accounts cannot set up.
 - **Chrome Web Store behaviour.** The Chrome mode is tested against a mock store that verifies the CRX3 signature. It has not been run against the real store. Uploads are reviewed before they go live, so the worker only confirms acceptance.
-- **Availability.** If the worker is down, releases stop. If members lose keys beyond the threshold, a project cannot ship. There is no break-glass recovery yet.
+- **Availability.** If the worker is down, releases stop. If members lose too many keys, the project can ship only through the recovery below.
+- **Recovery limits.** Guardians (accounts that are not members, named by the members' quorum) can replace the member list after a seven day public wait, and any current member can cancel during that time. So a hostile takeover needs the guardian threshold plus every member being absent for seven days. The flip side: one compromised member can cancel a legitimate recovery and stall it, though it cannot steal anything that way. Recovery can only be started if guardians were set up in advance. Approvals by removed members stop counting, so a release approved by old members cannot execute after a recovery.
 - **Timing.** The window is measured in NEAR block time and starts when quorum is reached. Watchers have only that long to flag a release, so a project should pick a window that matches how often someone is looking.
 - **The local chain.** The offline demo runs the contract code natively, without signatures, gas or the NEAR runtime's storage rules. It shows policy logic. The testnet demo is the check for the rest.

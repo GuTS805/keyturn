@@ -117,6 +117,39 @@ export async function verify(chain, { project, version, registryUrl, fetchImpl =
   return { ok: false, hash, reason: why };
 }
 
+const list = (text) => (text || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+/** A member proposes guardians. They take effect when the members' threshold proposed the same ones. */
+export function proposeGuardians(chain, { project, guardians, threshold }) {
+  return chain.call('propose_guardians', { project_id: project, guardians: list(guardians), threshold: Number(threshold) });
+}
+
+/** A guardian asks to replace the member list. */
+export function startRecovery(chain, { project, members, threshold }) {
+  return chain.call('start_recovery', { project_id: project, new_members: list(members), new_threshold: Number(threshold) });
+}
+
+export const approveRecovery = (chain, { project }) => chain.call('approve_recovery', { project_id: project });
+export const cancelRecovery = (chain, { project }) => chain.call('cancel_recovery', { project_id: project });
+export const finishRecovery = (chain, { project }) => chain.call('finish_recovery', { project_id: project });
+
+export async function recoveryStatus(chain, { project }) {
+  const [guardians, proposal, recovery] = await Promise.all([
+    chain.view('get_guardians', { project_id: project }),
+    chain.view('get_guardian_proposal', { project_id: project }),
+    chain.view('get_recovery', { project_id: project }),
+  ]);
+  const lines = [];
+  lines.push(guardians ? `guardians  ${guardians.threshold} of ${guardians.accounts.join(', ')}` : 'guardians  none');
+  if (proposal) lines.push(`proposed   ${proposal.guardians.threshold} of ${proposal.guardians.accounts.join(', ')} (${proposal.approvals.length} member approvals)`);
+  if (recovery) {
+    lines.push(`recovery   to ${recovery.new_threshold} of ${recovery.new_members.join(', ')}`);
+    lines.push(`           guardian approvals: ${recovery.approvals.join(', ')}`);
+    lines.push(recovery.ready_at_ms ? `           can finish at ${new Date(recovery.ready_at_ms).toISOString()}` : '           waiting for more guardians');
+  }
+  return lines.join('\n');
+}
+
 export function runWorkerBinary(bin, env = {}, args = []) {
   return (input) =>
     new Promise((resolve, reject) => {

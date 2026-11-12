@@ -84,8 +84,24 @@ try {
 if (initialised && process.argv.includes('--redeploy')) {
   // Upgrade the code and keep the state.
   const wasm = readFileSync(wasmPath);
-  await contract.deployContract(wasm);
+  try {
+    await contract.deployContract(wasm);
+  } catch (e) {
+    // Storage costs 1 NEAR per 100 KB. A bigger contract may need more balance.
+    if (!String(e.name || e).includes('LackBalance')) throw e;
+    console.log('contract account needs more balance for storage; sending 1.5 NEAR from the main account');
+    await mainAccount.transfer({ receiverId: contractId, amount: BigInt(parseNearAmount('1.5')) });
+    await contract.deployContract(wasm);
+  }
   console.log(`redeployed ${wasm.length} bytes to ${contractId} (state kept)`);
+  // New code may expect a newer state layout. If the old state cannot be read, migrate it.
+  try {
+    await provider.callFunction({ contractId, method: 'get_worker', args: {} });
+    console.log('state is compatible, no migration needed');
+  } catch {
+    await contract.callFunction({ contractId, methodName: 'migrate', args: {}, gas: 100_000_000_000_000n });
+    console.log('state migrated');
+  }
 } else if (initialised) {
   console.log(`contract already initialised at ${contractId}`);
 } else {
