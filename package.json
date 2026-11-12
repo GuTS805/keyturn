@@ -20,6 +20,7 @@
     "build:contract": "cargo build --release --target wasm32-unknown-unknown --manifest-path contract/Cargo.toml",
     "setup:testnet": "node --env-file=.env cli/scripts/setup-testnet.mjs",
     "demo": "node --env-file=.env cli/scripts/demo.mjs",
+    "demo:local": "node cli/scripts/demo.mjs --local",
     "npm:live": "node --env-file=.env cli/scripts/npm-live.mjs"
   }
 }

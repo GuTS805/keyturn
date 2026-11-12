@@ -50,7 +50,7 @@ Reads (`status`, `verify`) need no key. `verify npm:name@1.2.3` downloads what t
 npm run test:contract      # contract unit tests
 npm run test:worker        # worker unit tests
 npm run build:worker && npm run test:mock   # mock registry plus the real worker binary
-npm run install:cli && npm run test:cli     # CLI logic, including relay with the real worker binary
+npm run install:cli && npm run test:cli     # CLI logic, the local chain, relay with the real worker binary
 npm test                                    # all of the above
 ```
 
@@ -65,6 +65,15 @@ npm run install:cli
 export KEYTURN_CONTRACT=contract.hudich-keyturn.testnet
 node cli/src/index.mjs status npm:demo-mwci8d1h@1.0.0     # a release from the demo run, now Recalled
 ```
+
+## Try it in two minutes, no NEAR account needed
+
+```
+npm run build:worker
+npm run demo:local
+```
+
+You should see 18 `PASS` lines and `ALL CHECKS PASSED`. The contract here is the real contract code, run natively as a local chain (`contract/examples/localchain.rs`), with a simulated clock so the public window passes instantly. The worker is the real worker binary. Only the npm registry is a mock. The local chain does not check signatures or gas; those are the NEAR runtime's job, so use the testnet demo below for that part.
 
 ## Full demo
 

