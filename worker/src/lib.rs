@@ -463,6 +463,15 @@ pub fn run_publish(input: &PublishInput, secrets: &Secrets, registry: &str, http
             let text: String = String::from_utf8_lossy(&r.body).chars().take(200).collect();
             format!("PUT answered {}: {}", r.status, text)
         }
+        // npm answers 409 when this exact version was already uploaded and is still being
+        // processed. That is an earlier request of ours (for example one whose answer was
+        // lost), not a failure: report it as pending so the caller asks again to confirm.
+        Ok(r) if r.status == 409 && String::from_utf8_lossy(&r.body).contains("previously staged") => {
+            return Output::failure(
+                "pending",
+                "the registry already holds an upload of this version and is still processing it; send the same request again to confirm",
+            )
+        }
         Ok(r) => return Output::failure("publish_failed", registry_error(&r)),
         Err(e) => return Output::failure("publish_failed", e),
     };
@@ -858,6 +867,20 @@ mod tests {
         let text = out.detail.clone().unwrap();
         assert!(text.contains("403") && text.contains("previously published"));
         assert!(!serde_json::to_string(&out).unwrap().contains(TOKEN));
+    }
+
+    #[test]
+    fn a_version_the_registry_already_staged_is_pending_not_failed() {
+        let bytes = tgz("leftpad", "1.0.0", "x");
+        let hash = sha256_hex(&bytes);
+        let http = publish_registry(bytes.clone(), bytes).replace(
+            "PUT",
+            &format!("{}/leftpad", REG),
+            409,
+            br#"{"error":"Cannot publish over previously staged version \"1.0.0\"."}"#.to_vec(),
+        );
+        let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
+        assert_eq!(out.error.as_deref(), Some("pending"));
     }
 
     #[test]
