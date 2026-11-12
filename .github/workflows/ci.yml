@@ -1,0 +1,40 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            contract
+            worker
+      - name: Contract tests
+        run: cargo test --manifest-path contract/Cargo.toml
+      - name: Worker tests
+        run: cargo test --manifest-path worker/Cargo.toml
+      - name: Build the worker binary and the local chain
+        run: |
+          cargo build --manifest-path worker/Cargo.toml
+          cargo build --manifest-path contract/Cargo.toml --example localchain
+      - name: Mock registry tests
+        run: npm run test:mock
+      - name: CLI tests
+        run: |
+          npm --prefix cli ci
+          npm --prefix cli test
+      - name: Offline demos
+        run: |
+          node cli/scripts/demo.mjs --local
+          node cli/scripts/demo-chrome.mjs
