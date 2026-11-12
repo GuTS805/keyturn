@@ -37,6 +37,8 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for what Keyturn stops and what it does n
 
 ### Dashboard
 
+Live: https://keyturn-rho.vercel.app/ ([a real release, published through OutLayer](https://keyturn-rho.vercel.app/?project=npm:@scammerop08/keyturn-demo&version=0.0.3)). It reads the testnet contract and holds no keys.
+
 ```
 npx serve web        # or any static file server, then open the page
 ```
