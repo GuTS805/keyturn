@@ -64,7 +64,7 @@ pub struct PublishOptions {
 
 impl Default for PublishOptions {
     fn default() -> Self {
-        Self { allow_http_artifacts: false, post_check_attempts: 5, post_check_delay_ms: 2000 }
+        Self { allow_http_artifacts: false, post_check_attempts: 12, post_check_delay_ms: 5000 }
     }
 }
 
@@ -399,14 +399,17 @@ pub fn run_publish(input: &PublishInput, secrets: &Secrets, registry: &str, http
         ("content-type", "application/json"),
         ("npm-command", "publish"),
     ];
-    match http.put(&url, &headers, &body) {
-        Ok(r) if ok_status(&r) => {}
+    let put_note = match http.put(&url, &headers, &body) {
+        Ok(r) if ok_status(&r) => {
+            let text: String = String::from_utf8_lossy(&r.body).chars().take(200).collect();
+            format!("PUT answered {}: {}", r.status, text)
+        }
         Ok(r) => return Output::failure("publish_failed", registry_error(&r)),
         Err(e) => return Output::failure("publish_failed", e),
-    }
+    };
 
     // 4. Check what the registry now serves.
-    verify_published(
+    let mut out = verify_published(
         http,
         base,
         &input.package,
@@ -414,7 +417,12 @@ pub fn run_publish(input: &PublishInput, secrets: &Secrets, registry: &str, http
         &input.approved_hash,
         opts.post_check_attempts,
         opts.post_check_delay_ms,
-    )
+    );
+    if !out.ok {
+        let d = out.detail.take().unwrap_or_default();
+        out.detail = Some(format!("{} [{}]", d, put_note));
+    }
+    out
 }
 
 #[cfg(test)]
