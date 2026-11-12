@@ -19,13 +19,18 @@
 //!   KEYTURN_OAUTH_URL     defaults to https://oauth2.googleapis.com
 
 use keyturn_worker::chrome::{run_chrome, ChromeEndpoints, ChromeInput, ChromeSecrets, DEFAULT_API, DEFAULT_OAUTH};
-use keyturn_worker::http::native::UreqHttp;
-use keyturn_worker::{run, run_publish, Input, Output, PublishInput, PublishOptions, Secrets, DEFAULT_REGISTRY};
+#[cfg(feature = "native")]
+use keyturn_worker::http::native::UreqHttp as Client;
+#[cfg(all(not(feature = "native"), target_os = "wasi"))]
+use keyturn_worker::wasi_http::WasiHttp as Client;
+#[cfg(not(any(feature = "native", target_os = "wasi")))]
+compile_error!("build with the native feature, or for a wasi target");
+use keyturn_worker::{fit_output, run, run_publish, Input, Output, PublishInput, PublishOptions, Secrets, DEFAULT_REGISTRY};
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn emit(out: &Output) {
-    println!("{}", serde_json::to_string(out).expect("output serialises"));
+    println!("{}", fit_output(out));
 }
 
 fn fail(error: &str, detail: &str) -> ! {
@@ -69,7 +74,7 @@ fn main() {
             allow_http_artifacts: std::env::var("KEYTURN_ALLOW_HTTP").map(|v| v == "1").unwrap_or(false),
             ..PublishOptions::default()
         };
-        let out = run_chrome(&input, &secrets, &endpoints, &UreqHttp::new(), &opts);
+        let out = run_chrome(&input, &secrets, &endpoints, &Client::new(), &opts);
         emit(&out);
         if !out.ok {
             std::process::exit(2);
@@ -81,7 +86,7 @@ fn main() {
         fail("bad_secret", "NPM_TOKEN must be set");
     };
     let registry = std::env::var("KEYTURN_NPM_REGISTRY").unwrap_or_else(|_| DEFAULT_REGISTRY.to_string());
-    let http = UreqHttp::new();
+    let http = Client::new();
 
     let out = match mode.as_str() {
         "publish" => {

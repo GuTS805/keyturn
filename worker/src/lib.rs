@@ -18,6 +18,8 @@
 pub mod chrome;
 pub mod http;
 pub mod totp;
+#[cfg(target_os = "wasi")]
+pub mod wasi_http;
 
 use data_encoding::{BASE64, HEXLOWER};
 use http::{Http, Response};
@@ -69,7 +71,7 @@ impl Default for PublishOptions {
     }
 }
 
-#[derive(Serialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct Output {
     pub ok: bool,
     pub published_hash: Option<String>,
@@ -180,6 +182,30 @@ fn manifest_matches(tarball: &[u8], package: &str, version: &str) -> Result<(), 
         }
         Err(e) => Err(Output::failure("manifest_mismatch", e)),
     }
+}
+
+/// OutLayer accepts at most 900 bytes of output.
+pub const MAX_OUTPUT_BYTES: usize = 900;
+
+/// The output as JSON, with a long detail cut so the whole stays within the limit.
+pub fn fit_output(out: &Output) -> String {
+    let mut out = out.clone();
+    let mut text = serde_json::to_string(&out).expect("output serialises");
+    while text.len() > MAX_OUTPUT_BYTES {
+        let over = text.len() - MAX_OUTPUT_BYTES;
+        match out.detail.as_mut() {
+            Some(d) if d.len() > 3 => {
+                let keep = d.len().saturating_sub(over + 3);
+                let cut = (0..=keep).rev().find(|i| d.is_char_boundary(*i)).unwrap_or(0);
+                d.truncate(cut);
+                d.push_str("...");
+            }
+            Some(_) => out.detail = None,
+            None => break,
+        }
+        text = serde_json::to_string(&out).expect("output serialises");
+    }
+    text
 }
 
 fn ok_status(r: &Response) -> bool {
@@ -759,6 +785,17 @@ mod tests {
         let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
         assert_eq!(out.error.as_deref(), Some("manifest_mismatch"));
         assert_eq!(http.count("PUT"), 0);
+    }
+
+    #[test]
+    fn output_is_cut_to_fit_the_limit() {
+        let long = Output::failure("x", "é".repeat(2000));
+        let text = fit_output(&long);
+        assert!(text.len() <= MAX_OUTPUT_BYTES, "{}", text.len());
+        assert!(serde_json::from_str::<serde_json::Value>(&text).is_ok());
+        assert!(text.contains("..."));
+        let small = Output::failure("hash_mismatch", "short");
+        assert_eq!(fit_output(&small), serde_json::to_string(&small).unwrap());
     }
 
     #[test]

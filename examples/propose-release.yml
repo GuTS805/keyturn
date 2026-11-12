@@ -1,0 +1,36 @@
+# Example only. This workflow has not been run in GitHub Actions.
+#
+# CI builds the artifact and proposes its SHA-256 to the Keyturn contract.
+# It cannot approve, and it holds no publish credential. The worker publishes
+# after the maintainers approve and the public window passes.
+#
+# Secrets needed: KEYTURN_KEY (the access key of the proposer account).
+name: propose-release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    env:
+      KEYTURN_NETWORK: testnet
+      KEYTURN_CONTRACT: contract.example.testnet
+      KEYTURN_ACCOUNT: ci.example.testnet
+      KEYTURN_KEY: ${{ secrets.KEYTURN_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm pack
+      - name: Upload the tarball somewhere the worker can download it without credentials
+        run: echo "upload $(ls *.tgz) to a public https URL, for example a GitHub release asset"
+      - name: Propose its hash
+        run: |
+          git clone --depth 1 https://github.com/GuTS805/keyturn.git /tmp/keyturn
+          npm --prefix /tmp/keyturn/cli install
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="$(node -p "require('./package.json').name")"
+          node /tmp/keyturn/cli/src/index.mjs propose "npm:${NAME}@${VERSION}" --tarball "$(ls *.tgz)"

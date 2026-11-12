@@ -12,7 +12,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "keyturn-worker"
 path = "src/main.rs"
-required-features = ["native"]
 
 [features]
 default = ["native"]
@@ -30,6 +29,9 @@ tar = "0.4"
 ureq = { version = "2", optional = true }
 rsa = { version = "0.9", features = ["sha2"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+wasi-http-client = "0.2"
 
 [dev-dependencies]
 tar = "0.4"
