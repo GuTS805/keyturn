@@ -73,7 +73,7 @@ npm run build:worker
 npm run demo:local
 ```
 
-You should see 18 `PASS` lines and `ALL CHECKS PASSED`. The contract here is the real contract code, run natively as a local chain (`contract/examples/localchain.rs`), with a simulated clock so the public window passes instantly. The worker is the real worker binary. Only the npm registry is a mock. The local chain does not check signatures or gas; those are the NEAR runtime's job, so use the testnet demo below for that part.
+You should see 18 `PASS` lines and `ALL CHECKS PASSED`. `npm run demo:chrome` does the same for a Chrome extension. The contract here is the real contract code, run natively as a local chain (`contract/examples/localchain.rs`), with a simulated clock so the public window passes instantly. The worker is the real worker binary. Only the npm registry is a mock. The local chain does not check signatures or gas; those are the NEAR runtime's job, so use the testnet demo below for that part.
 
 ## Full demo
 
@@ -100,7 +100,21 @@ The worker has two modes for npm. Both only act on the hash the quorum approved.
 
 The registry address is read from the operator's environment, never from the request, so a requester cannot make the worker send its token elsewhere. Artifact URLs must be `https` and must not contain credentials.
 
-Other registries do not have the 2FA problem. The Chrome Web Store verified-uploads feature signs packages with a developer-held key, which suits this design, and is the next adapter.
+## Chrome Web Store
+
+The worker has a `chrome` mode. The quorum approves the SHA-256 of an extension ZIP. After the window the worker downloads the ZIP, checks the hash and the `manifest.json` version, wraps it in a CRX3 file signed with an RSA key that only the worker holds, uploads it through the Chrome Web Store API v2 and requests publication. CI holds neither the signing key nor any store credential.
+
+- The extension id is derived from the signing key, so the worker refuses any request that names an extension its key does not own (`key_mismatch`).
+- The store address comes from the operator's environment, never from the request, as for npm.
+- The worker's CRX3 output is byte-identical to the output of the independent `crx3` npm package for the same key and ZIP (checked once by hand, not part of the test suite).
+- `keyturn verify chrome:<extension id>@<version>` downloads the live CRX from Google's update service and hashes the ZIP inside it. The service only serves the latest version, so it also checks the version inside.
+
+```
+npm run build:worker
+npm run demo:chrome
+```
+
+Limits, stated plainly: this mode is tested against a mock store that checks the CRX3 signature with real cryptography, not against the real Chrome Web Store. The store reviews uploads before they go live, so the worker can only confirm that the store accepted the upload; `verify` shows what is actually live. A forum report says the first CRX upload for an extension may have to be done by hand in the developer dashboard so that the store records the signing key ([thread](https://groups.google.com/a/chromium.org/g/chromium-extensions/c/SybCdMk2LIE)); I could not confirm that. Environment: `CWS_CLIENT_ID`, `CWS_CLIENT_SECRET`, `CWS_REFRESH_TOKEN`, `CWS_PUBLISHER_ID`, `CRX_PRIVATE_KEY`; optional `KEYTURN_CWS_API`, `KEYTURN_OAUTH_URL`.
 
 ## Prior art
 

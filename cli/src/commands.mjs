@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { parseNearAmount } from 'near-api-js';
 import { sha256, splitProject, encodePackageName, hours } from './util.mjs';
+import { crxZip, zipManifestVersion } from './crx.mjs';
 
 const REGISTRIES = { npm: 'Npm', chrome: 'Chrome' };
 
@@ -75,14 +76,34 @@ export function describe({ project, release }) {
  * hash was approved by the quorum and published.
  */
 export async function verify(chain, { project, version, registryUrl, fetchImpl = fetch }) {
-  const { name } = splitProject(project);
-  const base = registryUrl.replace(/\/$/, '');
-  const metaRes = await fetchImpl(`${base}/${encodePackageName(name)}/${version}`);
-  if (!metaRes.ok) return { ok: false, reason: `registry has no ${name}@${version} (HTTP ${metaRes.status})` };
-  const meta = await metaRes.json();
-  const tarRes = await fetchImpl(meta.dist.tarball);
-  if (!tarRes.ok) return { ok: false, reason: `tarball download failed (HTTP ${tarRes.status})` };
-  const hash = sha256(Buffer.from(await tarRes.arrayBuffer()));
+  const { registry, name } = splitProject(project);
+  const base = (registryUrl || '').replace(/\/$/, '');
+  let hash;
+  if (registry === 'chrome') {
+    // The update service serves the live CRX of an extension. The approved hash is
+    // the hash of the ZIP inside it. It only serves the latest version, so the
+    // version inside must be the one asked for.
+    const crxRes = await fetchImpl(
+      `${base || 'https://clients2.google.com'}/service/update2/crx?response=redirect&prodversion=130.0&acceptformat=crx3&x=id%3D${name}%26uc`,
+    );
+    if (!crxRes.ok) return { ok: false, reason: `the store serves no extension ${name} (HTTP ${crxRes.status})` };
+    let zip;
+    try {
+      zip = crxZip(Buffer.from(await crxRes.arrayBuffer()));
+      const served = zipManifestVersion(zip);
+      if (served !== version) return { ok: false, reason: `the store serves version ${served}, not ${version}` };
+    } catch (e) {
+      return { ok: false, reason: `the store's download is not a valid extension: ${e.message}` };
+    }
+    hash = sha256(zip);
+  } else {
+    const metaRes = await fetchImpl(`${base}/${encodePackageName(name)}/${version}`);
+    if (!metaRes.ok) return { ok: false, reason: `registry has no ${name}@${version} (HTTP ${metaRes.status})` };
+    const meta = await metaRes.json();
+    const tarRes = await fetchImpl(meta.dist.tarball);
+    if (!tarRes.ok) return { ok: false, reason: `tarball download failed (HTTP ${tarRes.status})` };
+    hash = sha256(Buffer.from(await tarRes.arrayBuffer()));
+  }
   const released = await chain.view('is_released', { project_id: project, version, artifact_hash: hash });
   if (released) return { ok: true, hash, reason: 'approved by the quorum and published' };
   const release = await chain.view('get_release', { project_id: project, version });
@@ -121,7 +142,7 @@ export function runWorkerBinary(bin, env = {}) {
  */
 export async function relay(chain, { project, version, stageId, artifactUrl, runWorker }) {
   const { registry, name } = splitProject(project);
-  if (registry !== 'npm') throw new Error('relay supports npm projects only');
+  if (registry === 'chrome' && !artifactUrl) throw new Error('chrome projects need --artifact-url');
   if (!artifactUrl && !stageId) throw new Error('give --artifact-url (publish) or --stage-id (staged approve)');
   const release = await chain.view('get_release', { project_id: project, version });
   if (!release) throw new Error('this version was never proposed');
@@ -129,7 +150,7 @@ export async function relay(chain, { project, version, stageId, artifactUrl, run
     throw new Error(`release is ${release.status}; run execute once the public window has passed`);
   }
   const request = artifactUrl
-    ? { mode: 'publish', package: name, version, approved_hash: release.artifact_hash, artifact_url: artifactUrl }
+    ? { mode: registry === 'chrome' ? 'chrome' : 'publish', package: name, version, approved_hash: release.artifact_hash, artifact_url: artifactUrl }
     : { mode: 'stage_approve', stage_id: stageId, package: name, version, approved_hash: release.artifact_hash };
   const result = await runWorker(request);
   if (!result.ok) return { confirmed: false, result };

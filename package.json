@@ -21,6 +21,7 @@
     "setup:testnet": "node --env-file=.env cli/scripts/setup-testnet.mjs",
     "demo": "node --env-file=.env cli/scripts/demo.mjs",
     "demo:local": "node cli/scripts/demo.mjs --local",
+    "demo:chrome": "node cli/scripts/demo-chrome.mjs",
     "npm:live": "node --env-file=.env cli/scripts/npm-live.mjs"
   }
 }

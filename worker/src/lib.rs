@@ -15,6 +15,7 @@
 //! an address chosen by the requester. The operator fixes the registry through
 //! the environment instead.
 
+pub mod chrome;
 pub mod http;
 pub mod totp;
 

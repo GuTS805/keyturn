@@ -28,10 +28,17 @@ data-encoding = "2"
 flate2 = "1"
 tar = "0.4"
 ureq = { version = "2", optional = true }
+rsa = { version = "0.9", features = ["sha2"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tar = "0.4"
 flate2 = "1"
+rand = "0.8"
+
+# Key generation in tests is slow without optimisation.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 opt-level = "z"

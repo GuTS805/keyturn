@@ -24,8 +24,10 @@ Commands:
   reject    <project>@<version>        member vote to reject a release
   recall    <project>@<version>        member vote to recall a published release
   verify    <project>@<version> [--registry URL]    exit 1 unless the quorum approved the exact bytes served
+            (npm:name@v checks the registry tarball, chrome:<extension id>@v checks the live CRX's ZIP)
   relay     <project>@<version> --artifact-url URL --worker path/to/keyturn-worker   (local mode, direct publish)
             <project>@<version> --stage-id UUID --worker path/to/keyturn-worker      (local mode, staged approve)
+            chrome:<extension id>@<version> --artifact-url URL --worker ...          (local mode, Chrome Web Store)
   hash      <file>
 `;
 
@@ -115,7 +117,9 @@ async function main() {
     }
     case 'verify': {
       needVersion();
-      const registryUrl = v.registry || process.env.KEYTURN_NPM_REGISTRY || 'https://registry.npmjs.org';
+      const registryUrl = v.registry || (project.startsWith('chrome:')
+        ? process.env.KEYTURN_CHROME_UPDATE_URL
+        : process.env.KEYTURN_NPM_REGISTRY || 'https://registry.npmjs.org');
       const r = await cmd.verify(chain, { project, version, registryUrl });
       console.log(`${r.ok ? 'OK  ' : 'FAIL'} ${project}@${version}: ${r.reason}`);
       process.exit(r.ok ? 0 : 1);
