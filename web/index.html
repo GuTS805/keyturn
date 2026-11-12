@@ -116,6 +116,15 @@ $('form').addEventListener('submit', async (e) => {
   }
 });
 
+// A link like ?project=npm:name&version=1.0.0 runs the lookup straight away.
+const params = new URLSearchParams(location.search);
+if (params.get('contract')) $('contract').value = params.get('contract');
+if (params.get('project')) {
+  $('project').value = params.get('project');
+  $('version').value = params.get('version') || '';
+  $('form').requestSubmit();
+}
+
 $('file').addEventListener('change', async (e) => {
   const f = e.target.files[0];
   if (!f || !approvedHash) return;
