@@ -196,14 +196,25 @@ test('worker publish mode refuses an artifact swapped after approval', { skip: !
   assert.equal(reg.isPublished('direct-d', '1.0.0'), false);
 });
 
-test('worker publish mode reports a version that already exists', { skip: !existsSync(workerBin) }, async () => {
+test('a repeated publish request confirms the existing version instead of publishing again', { skip: !existsSync(workerBin) }, async () => {
   const bytes = makePackage('direct-e', '1.0.0');
   const { url } = await artifact(bytes);
   const req = { mode: 'publish', package: 'direct-e', version: '1.0.0', approved_hash: sha256(bytes), artifact_url: url };
   assert.equal((await runWorker(req, workerEnvHttp)).out.ok, true);
   const second = await runWorker(req, workerEnvHttp);
-  assert.equal(second.out.error, 'publish_failed');
-  assert.match(second.out.detail, /previously published/);
+  assert.equal(second.out.ok, true);
+  assert.equal(second.out.published_hash, sha256(bytes));
+});
+
+test('worker never overwrites a version that exists with other bytes', { skip: !existsSync(workerBin) }, async () => {
+  const first = makePackage('direct-h', '1.0.0');
+  const other = makePackage('direct-h', '1.0.0', 'different();');
+  const a1 = await artifact(first);
+  assert.equal((await runWorker({ mode: 'publish', package: 'direct-h', version: '1.0.0', approved_hash: sha256(first), artifact_url: a1.url }, workerEnvHttp)).out.ok, true);
+  const a2 = await artifact(other);
+  const r = await runWorker({ mode: 'publish', package: 'direct-h', version: '1.0.0', approved_hash: sha256(other), artifact_url: a2.url }, workerEnvHttp);
+  assert.equal(r.out.ok, false);
+  assert.equal(r.out.error, 'version_exists');
 });
 
 test('worker refuses plain http artifacts unless the operator allows them', { skip: !existsSync(workerBin) }, async () => {
