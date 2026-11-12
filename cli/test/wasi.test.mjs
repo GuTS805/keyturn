@@ -88,3 +88,12 @@ test('the wasm worker signs a CRX3 and uploads it to the mock Chrome store', { s
     await store.close();
   }
 });
+
+test('the wasm worker exits normally even when the request fails, so a TEE keeps the JSON', { skip }, () => {
+  const r = spawnSync('wasmtime', ['run', '-S', 'http', wasm], {
+    input: JSON.stringify({ mode: 'publish', package: 'x', version: '1.0.0', approved_hash: 'nope', artifact_url: 'https://a.test/x' }),
+    shell: process.platform === 'win32',
+  });
+  assert.equal(r.status, 0);
+  assert.equal(JSON.parse(r.stdout.toString()).error, 'bad_secret');
+});
