@@ -68,7 +68,7 @@ node cli/src/index.mjs status npm:demo-mwci8d1h@1.0.0     # a release from the d
 
 ## Full demo
 
-The demo registers a project on the testnet contract, stages packages on a local mock npm registry, and walks through the attack scenarios with the real contract and the real worker binary. Only the registry is mocked.
+The demo registers a project on the testnet contract, uploads build artifacts to a local mock npm registry, and walks through the attack scenarios with the real contract and the real worker binary. Only the registry is mocked.
 
 ```
 npm run install:cli && npm run build:worker && npm run build:contract
@@ -81,6 +81,17 @@ npm run demo
 What it checks, in order: a stage-only CI account cannot approve; one maintainer alone cannot release; execution is refused while the public window is open; after quorum and window the worker publishes and the contract records it; `verify` passes on the served bytes; a tarball swapped after approval is refused by the worker and never recorded; a quorum recall makes `verify` fail.
 
 Build note: `contract/.cargo/config.toml` sets `--cfg near` for the wasm target. Without it near-sdk-env compiles its local fallback, and panic messages never reach the chain.
+
+## npm: publish modes and their limits
+
+The worker has two modes for npm. Both only act on the hash the quorum approved.
+
+- **Direct publish (default).** CI uploads the build artifact anywhere and proposes its SHA-256 to the contract. After quorum and the public window, the worker downloads the artifact without credentials, checks the hash and the package name and version in `package.json`, and publishes with a granular token held only by the worker. It then downloads what the registry serves and checks the hash again. This needs a token with "bypass 2FA". npm will remove direct publishing with such tokens in January 2027 ([npm changelog](https://github.blog/changelog/2025-09-29-strengthening-npm-security-important-changes-to-authentication-and-token-management/)), so this mode has an end date.
+- **Staged approve.** CI runs `npm stage publish` and the worker approves the staged version with a one-time code. npm no longer allows new authenticator-app setups, so this works only for accounts that still have one, and npm intends approval to be a human 2FA step. It is kept for those accounts and for the mock registry.
+
+The registry address is read from the operator's environment, never from the request, so a requester cannot make the worker send its token elsewhere. Artifact URLs must be `https` and must not contain credentials.
+
+Other registries do not have the 2FA problem. The Chrome Web Store verified-uploads feature signs packages with a developer-held key, which suits this design, and is the next adapter.
 
 ## Prior art
 

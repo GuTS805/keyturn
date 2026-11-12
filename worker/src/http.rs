@@ -7,11 +7,15 @@ pub struct Response {
 }
 
 pub trait Http {
+    /// Requests to the registry. These carry credentials and never follow redirects.
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Response, String>;
     fn post(&self, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<Response, String>;
+    fn put(&self, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<Response, String>;
+    /// A GET without any credentials, for artifacts. May follow a few redirects.
+    fn fetch_public(&self, url: &str) -> Result<Response, String>;
 }
 
-/// Largest body the worker will read from a registry.
+/// Largest body the worker will read.
 pub const MAX_BODY: u64 = 64 * 1024 * 1024;
 
 #[cfg(feature = "native")]
@@ -21,16 +25,19 @@ pub mod native {
     use std::time::Duration;
 
     pub struct UreqHttp {
-        agent: ureq::Agent,
+        strict: ureq::Agent,
+        public: ureq::Agent,
     }
 
     impl UreqHttp {
         pub fn new() -> Self {
-            let agent = ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(60))
-                .redirects(0)
-                .build();
-            Self { agent }
+            let build = |redirects| {
+                ureq::AgentBuilder::new()
+                    .timeout(Duration::from_secs(60))
+                    .redirects(redirects)
+                    .build()
+            };
+            Self { strict: build(0), public: build(4) }
         }
     }
 
@@ -58,21 +65,28 @@ pub mod native {
         Ok(Response { status, body })
     }
 
+    fn with_headers(mut req: ureq::Request, headers: &[(&str, &str)]) -> ureq::Request {
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        req
+    }
+
     impl Http for UreqHttp {
         fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Response, String> {
-            let mut req = self.agent.get(url);
-            for (k, v) in headers {
-                req = req.set(k, v);
-            }
-            finish(req.call())
+            finish(with_headers(self.strict.get(url), headers).call())
         }
 
         fn post(&self, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<Response, String> {
-            let mut req = self.agent.post(url);
-            for (k, v) in headers {
-                req = req.set(k, v);
-            }
-            finish(req.send_bytes(body))
+            finish(with_headers(self.strict.post(url), headers).send_bytes(body))
+        }
+
+        fn put(&self, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<Response, String> {
+            finish(with_headers(self.strict.put(url), headers).send_bytes(body))
+        }
+
+        fn fetch_public(&self, url: &str) -> Result<Response, String> {
+            finish(self.public.get(url).call())
         }
     }
 }

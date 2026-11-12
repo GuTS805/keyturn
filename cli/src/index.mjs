@@ -24,7 +24,8 @@ Commands:
   reject    <project>@<version>        member vote to reject a release
   recall    <project>@<version>        member vote to recall a published release
   verify    <project>@<version> [--registry URL]    exit 1 unless the quorum approved the exact bytes served
-  relay     <project>@<version> --stage-id UUID --worker path/to/keyturn-worker   (local mode)
+  relay     <project>@<version> --artifact-url URL --worker path/to/keyturn-worker   (local mode, direct publish)
+            <project>@<version> --stage-id UUID --worker path/to/keyturn-worker      (local mode, staged approve)
   hash      <file>
 `;
 
@@ -43,6 +44,7 @@ const options = {
   reason: { type: 'string' },
   bond: { type: 'string' },
   'stage-id': { type: 'string' },
+  'artifact-url': { type: 'string' },
   worker: { type: 'string' },
   json: { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
@@ -121,11 +123,12 @@ async function main() {
     }
     case 'relay': {
       needVersion();
-      if (!v['stage-id'] || !v.worker) fail('relay needs --stage-id and --worker');
+      if (!v.worker || (!v['stage-id'] && !v['artifact-url'])) fail('relay needs --worker and one of --artifact-url or --stage-id');
       const r = await cmd.relay(chain, {
         project,
         version,
         stageId: v['stage-id'],
+        artifactUrl: v['artifact-url'],
         runWorker: cmd.runWorkerBinary(v.worker),
       });
       console.log(JSON.stringify(r.result));

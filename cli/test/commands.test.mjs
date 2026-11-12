@@ -212,3 +212,56 @@ test('relay refuses to run before the window has passed', async () => {
     /release is Pending/,
   );
 });
+
+async function artifact(tarball) {
+  const r = await fetch(`${reg.url}/-/mock/artifact`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${CI}` },
+    body: JSON.stringify({ tarball: tarball.toString('base64') }),
+  });
+  return r.json();
+}
+
+const httpEnv = () => ({ ...workerEnv(), KEYTURN_ALLOW_HTTP: '1' });
+
+test('relay in publish mode confirms after the worker published the artifact', { skip: !hasWorker }, async () => {
+  const bytes = makePackage('relay-c', '1.0.0');
+  const { url } = await artifact(bytes);
+  const chain = new StubChain({ get_release: { status: 'Executing', artifact_hash: sha256(bytes) } });
+  const r = await cmd.relay(chain, {
+    project: 'npm:relay-c',
+    version: '1.0.0',
+    artifactUrl: url,
+    runWorker: cmd.runWorkerBinary(workerBin, httpEnv()),
+  });
+  assert.equal(r.confirmed, true);
+  assert.equal(reg.isPublished('relay-c', '1.0.0'), true);
+  assert.equal(chain.calls[0].method, 'confirm_published');
+  assert.equal(chain.calls[0].args.published_hash, sha256(bytes));
+});
+
+test('relay in publish mode does not confirm when the artifact was swapped', { skip: !hasWorker }, async () => {
+  const bytes = makePackage('relay-d', '1.0.0');
+  const { id, url } = await artifact(bytes);
+  const evil = makePackage('relay-d', '1.0.0', 'steal();');
+  await fetch(`${reg.url}/-/mock/tamper-artifact/${id}`, { method: 'POST', body: JSON.stringify({ tarball: evil.toString('base64') }) });
+  const chain = new StubChain({ get_release: { status: 'Executing', artifact_hash: sha256(bytes) } });
+  const r = await cmd.relay(chain, {
+    project: 'npm:relay-d',
+    version: '1.0.0',
+    artifactUrl: url,
+    runWorker: cmd.runWorkerBinary(workerBin, httpEnv()),
+  });
+  assert.equal(r.confirmed, false);
+  assert.equal(r.result.error, 'hash_mismatch');
+  assert.equal(chain.calls.length, 0);
+  assert.equal(reg.isPublished('relay-d', '1.0.0'), false);
+});
+
+test('relay needs either an artifact url or a stage id', async () => {
+  const chain = new StubChain({ get_release: { status: 'Executing', artifact_hash: 'a'.repeat(64) } });
+  await assert.rejects(
+    () => cmd.relay(chain, { project: 'npm:x', version: '1.0.0', runWorker: async () => ({}) }),
+    /--artifact-url/,
+  );
+});

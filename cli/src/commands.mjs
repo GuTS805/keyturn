@@ -119,20 +119,19 @@ export function runWorkerBinary(bin, env = {}) {
  * and reports the published hash back as the worker account. With OutLayer this
  * step is replaced by the yield/resume callback.
  */
-export async function relay(chain, { project, version, stageId, runWorker }) {
+export async function relay(chain, { project, version, stageId, artifactUrl, runWorker }) {
   const { registry, name } = splitProject(project);
   if (registry !== 'npm') throw new Error('relay supports npm projects only');
+  if (!artifactUrl && !stageId) throw new Error('give --artifact-url (publish) or --stage-id (staged approve)');
   const release = await chain.view('get_release', { project_id: project, version });
   if (!release) throw new Error('this version was never proposed');
   if (release.status !== 'Executing') {
     throw new Error(`release is ${release.status}; run execute once the public window has passed`);
   }
-  const result = await runWorker({
-    stage_id: stageId,
-    package: name,
-    version,
-    approved_hash: release.artifact_hash,
-  });
+  const request = artifactUrl
+    ? { mode: 'publish', package: name, version, approved_hash: release.artifact_hash, artifact_url: artifactUrl }
+    : { mode: 'stage_approve', stage_id: stageId, package: name, version, approved_hash: release.artifact_hash };
+  const result = await runWorker(request);
   if (!result.ok) return { confirmed: false, result };
   await chain.call('confirm_published', {
     project_id: project,

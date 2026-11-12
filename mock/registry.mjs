@@ -8,9 +8,14 @@
 //   DELETE /-/stage/:id                reject it   (needs a one-time password)
 //   GET    /:name/:version             published version metadata
 //
-// Two things are mock only, and are prefixed with /-/mock/:
-//   POST /-/mock/stage          stands in for `npm stage publish`
-//   POST /-/mock/tamper/:id     swaps the staged bytes, to simulate a tampered build
+//   PUT    /:name                      direct publish (bot token only, like a read-write token)
+//
+// These are mock only, and are prefixed with /-/mock/:
+//   POST /-/mock/stage                 stands in for `npm stage publish`
+//   POST /-/mock/tamper/:id            swaps the staged bytes, to simulate a tampered build
+//   POST /-/mock/artifact              stores a build artifact, returns its URL
+//   GET  /-/mock/artifacts/:id         serves it without credentials
+//   POST /-/mock/tamper-artifact/:id   swaps the artifact bytes
 //
 // Two credentials exist. The bot token can approve with a valid one-time
 // password. The CI token can only stage, like a trusted publishing identity.
@@ -73,6 +78,7 @@ const sha512b64 = (b) => 'sha512-' + createHash('sha512').update(b).digest('base
 export function startRegistry({ port = 0, botToken, ciToken, totpSecret, now = () => Math.floor(Date.now() / 1000) }) {
   const staged = new Map(); // id -> { id, name, version, tarball, createdAt }
   const published = new Map(); // name -> Map(version -> { tarball })
+  const artifacts = new Map(); // id -> Buffer
   let origin = '';
 
   const role = (req) => {
@@ -111,7 +117,28 @@ export function startRegistry({ port = 0, botToken, ciToken, totpSecret, now = (
         return json(res, 201, { id });
       }
 
-      let m = /^\/-\/mock\/tamper\/([0-9a-f-]{36})$/.exec(path);
+      if (req.method === 'POST' && path === '/-/mock/artifact') {
+        if (!who) return json(res, 401, { error: 'unauthorized' });
+        const body = JSON.parse((await readBody(req)).toString());
+        const id = randomUUID();
+        artifacts.set(id, Buffer.from(body.tarball, 'base64'));
+        return json(res, 201, { id, url: `${origin}/-/mock/artifacts/${id}` });
+      }
+
+      let m = /^\/-\/mock\/artifacts\/([0-9a-f-]{36})$/.exec(path);
+      if (m && req.method === 'GET') {
+        const buf = artifacts.get(m[1]);
+        return buf ? bytes(res, 200, buf) : json(res, 404, { error: 'not found' });
+      }
+
+      m = /^\/-\/mock\/tamper-artifact\/([0-9a-f-]{36})$/.exec(path);
+      if (m && req.method === 'POST') {
+        if (!artifacts.has(m[1])) return json(res, 404, { error: 'not found' });
+        artifacts.set(m[1], Buffer.from(JSON.parse((await readBody(req)).toString()).tarball, 'base64'));
+        return json(res, 200, { ok: true });
+      }
+
+      m = /^\/-\/mock\/tamper\/([0-9a-f-]{36})$/.exec(path);
       if (m && req.method === 'POST') {
         const item = staged.get(m[1]);
         if (!item) return json(res, 404, { error: 'not found' });
@@ -148,6 +175,34 @@ export function startRegistry({ port = 0, botToken, ciToken, totpSecret, now = (
           res.writeHead(204).end();
           return;
         }
+      }
+
+      m = /^\/((?:@[^/]+\/)?[^/@][^/]*)$/.exec(path);
+      if (m && req.method === 'PUT' && !path.startsWith('/-/')) {
+        if (!who) return json(res, 401, { error: 'unauthorized' });
+        if (who !== 'bot') return json(res, 403, { error: 'stage-only credentials cannot publish directly' });
+        const doc = JSON.parse((await readBody(req)).toString());
+        const name = m[1];
+        if (doc.name !== name) return json(res, 400, { error: 'name does not match the URL' });
+        for (const [version, vdoc] of Object.entries(doc.versions || {})) {
+          const att = doc._attachments?.[`${name}-${version}.tgz`];
+          if (!att) return json(res, 400, { error: 'missing attachment' });
+          const tarball = Buffer.from(att.data, 'base64');
+          if (tarball.length !== att.length) return json(res, 400, { error: 'attachment length mismatch' });
+          if (sha1(tarball) !== vdoc.dist?.shasum || sha512b64(tarball) !== vdoc.dist?.integrity) {
+            return json(res, 400, { error: 'integrity does not match the attachment' });
+          }
+          const manifest = JSON.parse(readTgz(tarball)['package/package.json'].toString());
+          if (manifest.name !== name || manifest.version !== version) {
+            return json(res, 400, { error: 'package.json does not match the request' });
+          }
+          if (published.get(name)?.has(version)) {
+            return json(res, 403, { error: `You cannot publish over the previously published versions: ${version}.` });
+          }
+          if (!published.has(name)) published.set(name, new Map());
+          published.get(name).set(version, { tarball });
+        }
+        return json(res, 200, { ok: true });
       }
 
       m = /^\/-\/tarballs\/(.+)\/([^/]+)\.tgz$/.exec(path);
