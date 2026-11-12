@@ -82,7 +82,7 @@ npm run build:worker
 npm run demo:local
 ```
 
-You should see 18 `PASS` lines and `ALL CHECKS PASSED`. `npm run demo:chrome` does the same for a Chrome extension. The contract here is the real contract code, run natively as a local chain (`contract/examples/localchain.rs`), with a simulated clock so the public window passes instantly. The worker is the real worker binary. Only the npm registry is a mock. The local chain does not check signatures or gas; those are the NEAR runtime's job, so use the testnet demo below for that part.
+You should see 22 `PASS` lines and `ALL CHECKS PASSED`. `npm run demo:chrome` does the same for a Chrome extension. The contract here is the real contract code, run natively as a local chain (`contract/examples/localchain.rs`), with a simulated clock so the public window passes instantly. The worker is the real worker binary. Only the npm registry is a mock. The local chain does not check signatures or gas; those are the NEAR runtime's job, so use the testnet demo below for that part.
 
 ## Full demo
 
@@ -110,6 +110,20 @@ The worker has two modes for npm. Both only act on the hash the quorum approved.
 **Real npm, verified.** `npm run demo:real -- 0.0.2 --yes` runs the whole chain with nothing mocked: the testnet contract enforces the quorum and window, the worker publishes to the real npm registry, and the contract records it. The run for `@scammerop08/keyturn-demo@0.0.2` is the one linked from the project page. npm answers a publish with `202 Accepted` and shows a new version a few minutes later, so the worker answers `pending` and is safe to ask again: a repeated request confirms what the registry serves, never publishes twice, and refuses to touch a version that exists with other bytes.
 
 The registry address is read from the operator's environment, never from the request, so a requester cannot make the worker send its token elsewhere. Artifact URLs must be `https` and must not contain credentials.
+
+## Watchtower
+
+The public window only helps if someone looks. `keyturn watch` is the one who looks:
+
+```
+keyturn watch npm:name@1.2.4 --tarball build.tgz --registry https://registry.npmjs.org --flag
+```
+
+It checks that the file is exactly the bytes the quorum approved, finds the previous version on the registry (or takes `--previous old.tgz`), and reports what is new in this release: an added or changed install script (`preinstall`, `install`, `postinstall`), dependencies from a URL, newly appearing process execution, network access, `eval`, reads of credential or wallet files, encoded blobs, and new executables. Reading credentials and using the network in the same release is the exfiltration shape and counts as high. Only what is new counts, so a package that always spawned processes is not reported for it. With `--flag`, a high finding inside the public window (status Pending) flags the release with a 0.1 NEAR bond, which blocks execution until the members decide. Exit code 3 means a flag-worthy release.
+
+`--ai` adds a second opinion from NEAR AI Cloud (`NEAR_AI_API_KEY`, and the model name in `KEYTURN_AI_MODEL`, which is not guessed). The package text is sent as untrusted data with an instruction to ignore anything inside it, and the answer can only add a finding, never lower the rules' verdict.
+
+Honest numbers: the rules are tested on synthetic attacks (install-script downloads, credential theft plus network, URL dependencies, obfuscated blobs) and produced no findings on five real version pairs I tried (chalk, express, lodash, axios, commander). I have not tested them against real malicious releases, so treat them as a net with large holes: a determined attacker can avoid these patterns. The value is a cheap first filter that makes a human look. The AI call has been tested only against a stub of the API, not the live service.
 
 ## Break-glass recovery
 

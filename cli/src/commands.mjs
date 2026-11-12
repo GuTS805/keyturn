@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { parseNearAmount } from 'near-api-js';
 import { sha256, splitProject, encodePackageName, hours } from './util.mjs';
 import { crxZip, zipManifestVersion } from './crx.mjs';
+import { analyze, aiReview, withAi, flagReason, describeReport } from './watchtower.mjs';
 
 const REGISTRIES = { npm: 'Npm', chrome: 'Chrome' };
 
@@ -115,6 +116,60 @@ export async function verify(chain, { project, version, registryUrl, fetchImpl =
         ? `the registry serves ${hash} but the quorum approved ${release.artifact_hash}`
         : `the release is ${release.status}, not published`;
   return { ok: false, hash, reason: why };
+}
+
+/** The most recent published version before `version`, from the registry. Null if there is none. */
+export async function fetchPrevious(name, version, registryUrl, fetchImpl = fetch) {
+  const base = registryUrl.replace(/\/$/, '');
+  const res = await fetchImpl(`${base}/${encodePackageName(name)}`);
+  if (!res.ok) return null;
+  const doc = await res.json();
+  const candidates = Object.keys(doc.versions || {})
+    .filter((v) => v !== version && !v.endsWith('-stage'))
+    .sort((a, b) => Date.parse(doc.time?.[b] || 0) - Date.parse(doc.time?.[a] || 0));
+  if (!candidates.length) return null;
+  const tar = await fetchImpl(doc.versions[candidates[0]].dist.tarball);
+  if (!tar.ok) return null;
+  return { version: candidates[0], bytes: Buffer.from(await tar.arrayBuffer()) };
+}
+
+/**
+ * Watchtower. Looks at the exact bytes the quorum approved, compares them with the previous
+ * version, and flags the release (with a bond) if it finds something that should stop it.
+ * It only acts while the release is Pending, which is the public window.
+ */
+export async function watch(chain, { project, version, tarball, previous, registryUrl, flag: doFlag, bond, ai, fetchImpl = fetch }) {
+  const release = await chain.view('get_release', { project_id: project, version });
+  if (!release) throw new Error('this version was never proposed');
+  const bytes = await readFile(tarball);
+  const hash = sha256(bytes);
+  if (hash !== release.artifact_hash) {
+    throw new Error(`this file hashes to ${hash}, but the quorum approved ${release.artifact_hash}; watch the approved bytes`);
+  }
+  let before = null;
+  let comparedWith = null;
+  if (previous) {
+    before = await readFile(previous);
+    comparedWith = previous;
+  } else if (registryUrl) {
+    const prev = await fetchPrevious(splitProject(project).name, version, registryUrl, fetchImpl);
+    if (prev) {
+      before = prev.bytes;
+      comparedWith = `${prev.version} from the registry`;
+    }
+  }
+  let report = analyze(bytes, before);
+  if (ai && report.findings.length) report = withAi(report, await aiReview(report, { ...ai, fetchImpl }));
+  const out = { report, comparedWith, text: describeReport(report), flagged: false, status: release.status };
+  if (doFlag && report.verdict === 'flag') {
+    if (release.status !== 'Pending') {
+      out.note = `not flagged: the release is ${release.status}, and only a Pending release (public window open) can be flagged`;
+    } else {
+      await flag(chain, { project, version, reason: flagReason(report), bond });
+      out.flagged = true;
+    }
+  }
+  return out;
 }
 
 const list = (text) => (text || '').split(',').map((s) => s.trim()).filter(Boolean);

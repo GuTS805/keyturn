@@ -34,6 +34,9 @@ Commands:
              cancel  --project P                                member: veto
              finish  --project P                                anyone: after the wait
              status  --project P
+  watch     <project>@<version> --tarball file.tgz [--previous old.tgz | --registry URL] [--flag] [--bond 0.1] [--ai]
+            analyse the approved bytes against the previous version; with --flag, flag a risky release in its public window
+            --ai adds a second opinion from NEAR AI Cloud (NEAR_AI_API_KEY and KEYTURN_AI_MODEL)
   hash      <file>
 `;
 
@@ -50,6 +53,9 @@ const options = {
   'window-hours': { type: 'string' },
   tarball: { type: 'string' },
   guardians: { type: 'string' },
+  previous: { type: 'string' },
+  flag: { type: 'boolean' },
+  ai: { type: 'boolean' },
   reason: { type: 'string' },
   bond: { type: 'string' },
   'stage-id': { type: 'string' },
@@ -139,6 +145,23 @@ async function main() {
       if (!v.reason) fail('flag needs --reason');
       await cmd.flag(chain, { project, version, reason: v.reason, bond: v.bond });
       return console.log(`flagged ${project}@${version}`);
+    case 'watch': {
+      needVersion();
+      if (!v.tarball) fail('watch needs --tarball');
+      const ai = v.ai ? { apiKey: process.env.NEAR_AI_API_KEY, model: process.env.KEYTURN_AI_MODEL } : null;
+      if (ai && (!ai.apiKey || !ai.model)) fail('--ai needs NEAR_AI_API_KEY and KEYTURN_AI_MODEL');
+      const r = await cmd.watch(chain, {
+        project, version, tarball: v.tarball, previous: v.previous,
+        registryUrl: v.registry || process.env.KEYTURN_NPM_REGISTRY || (v.previous ? undefined : 'https://registry.npmjs.org'),
+        flag: v.flag, bond: v.bond, ai,
+      });
+      console.log(`compared with ${r.comparedWith || 'nothing (no earlier version found)'}`);
+      console.log(r.text);
+      if (r.note) console.log(r.note);
+      if (r.flagged) console.log('FLAGGED: the release is blocked until the members decide');
+      process.exit(r.report.verdict === 'flag' ? 3 : 0);
+      break;
+    }
     case 'status': {
       const s = await cmd.status(chain, { project, version });
       return console.log(v.json ? JSON.stringify(s, null, 2) : cmd.describe(s));

