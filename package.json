@@ -13,6 +13,7 @@
     "test:contract": "cargo test --manifest-path contract/Cargo.toml",
     "test:worker": "cargo test --manifest-path worker/Cargo.toml",
     "build:worker": "cargo build --manifest-path worker/Cargo.toml",
+    "build:worker:wasm": "cargo build --release --target wasm32-wasip2 --no-default-features --manifest-path worker/Cargo.toml",
     "mock": "node mock/registry.mjs",
     "install:cli": "npm --prefix cli install",
     "test:cli": "npm --prefix cli test",

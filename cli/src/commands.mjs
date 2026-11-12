@@ -117,10 +117,10 @@ export async function verify(chain, { project, version, registryUrl, fetchImpl =
   return { ok: false, hash, reason: why };
 }
 
-export function runWorkerBinary(bin, env = {}) {
+export function runWorkerBinary(bin, env = {}, args = []) {
   return (input) =>
     new Promise((resolve, reject) => {
-      const child = spawn(bin, [], { env: { ...process.env, ...env } });
+      const child = spawn(bin, args, { env: { ...process.env, ...env } });
       let out = '';
       child.stdout.on('data', (d) => (out += d));
       child.on('error', reject);

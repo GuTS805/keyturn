@@ -2,7 +2,7 @@
 
 Nobody ships a release alone.
 
-Keyturn puts a two-person rule in front of software releases. A NEAR contract holds the approval policy (who must approve, how many, and a public waiting window). The credential that actually publishes the package lives only inside a TEE worker, and the worker acts only on releases the contract has approved.
+Keyturn puts a two-person rule in front of software releases. A NEAR contract holds the approval policy (who must approve, how many, and a public waiting window). The credential that actually publishes the package lives only in a worker, designed for a TEE, and the worker acts only on releases the contract has approved.
 
 Status: work in progress, built for NEAR HACKATHON (tracks: open, security, agents).
 
@@ -27,12 +27,21 @@ Layout:
 
 ```
 contract/   NEAR smart contract (Rust): quorum, public window, bonded flags, recall
-worker/     Stateless publisher (Rust, builds natively and for wasm32-wasip2)
-mock/       Local stand-in for npm's staged publishing API, for tests and demos
+worker/     Stateless publisher (Rust, builds natively and for wasm32-wasip2): npm and Chrome Web Store modes
+mock/       Local stand-ins for npm and the Chrome Web Store, for tests and demos
 cli/        `keyturn` command line (Node): propose, approve, flag, status, verify, relay
+web/        Read-only dashboard (one static page, no build): look up a release, check a file against the approved hash
 ```
 
-The dashboard is added as it is built.
+See [THREAT_MODEL.md](THREAT_MODEL.md) for what Keyturn stops and what it does not.
+
+### Dashboard
+
+```
+npx serve web        # or any static file server, then open the page
+```
+
+It reads the contract over public RPC and holds no keys. The default contract is the testnet deployment below. Choosing a downloaded package hashes it in the browser and compares it with the approved hash.
 
 ## CLI
 
@@ -115,6 +124,20 @@ npm run demo:chrome
 ```
 
 Limits, stated plainly: this mode is tested against a mock store that checks the CRX3 signature with real cryptography, not against the real Chrome Web Store. The store reviews uploads before they go live, so the worker can only confirm that the store accepted the upload; `verify` shows what is actually live. A forum report says the first CRX upload for an extension may have to be done by hand in the developer dashboard so that the store records the signing key ([thread](https://groups.google.com/a/chromium.org/g/chromium-extensions/c/SybCdMk2LIE)); I could not confirm that. Environment: `CWS_CLIENT_ID`, `CWS_CLIENT_SECRET`, `CWS_REFRESH_TOKEN`, `CWS_PUBLISHER_ID`, `CRX_PRIVATE_KEY`; optional `KEYTURN_CWS_API`, `KEYTURN_OAUTH_URL`.
+
+## Running the worker in a TEE (OutLayer)
+
+The worker is built to run on [OutLayer](https://docs.near.org/primitives/off-chain-compute/outlayer), NEAR's TEE compute: it reads one JSON request on stdin, writes one JSON result of at most 900 bytes on stdout, reads secrets from environment variables, and makes HTTP calls through `wasi:http`. Those are the constraints OutLayer documents (the same page lists a 60 second limit per run).
+
+```
+npm run build:worker:wasm      # worker/target/wasm32-wasip2/release/keyturn-worker.wasm (about 700 KB)
+cargo install wasmtime-cli --locked
+npm run test:cli               # includes cli/test/wasi.test.mjs, which runs the wasm under wasmtime
+```
+
+What is verified: the wasm build runs under wasmtime, and over `wasi:http` it publishes to the mock npm registry, refuses a swapped artifact, and signs and uploads a CRX3 to the mock Chrome store.
+
+What is not: I have not deployed it to OutLayer, registered it with a TEE proof, stored secrets there, or driven it from the contract's yield and resume. Today the CLI's `relay` command plays that role locally: it reads the approved hash from the contract, runs the worker, and reports the result as the worker account. The contract and worker are ready for that hand-off, but the TEE guarantee (even the operator cannot read the credential) is not demonstrated by this repository. A real npm publish took longer than the 60 second limit would leave room for when the registry is slow, so on OutLayer the post-publish check may need to run as a second call.
 
 ## Prior art
 
