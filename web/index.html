@@ -38,6 +38,12 @@
   .tick { display: inline-block; width: 1.1em; }
   .error { color: var(--bad); }
   h2 { font-size: 1rem; margin: 0 0 8px; }
+  .verdict { font-weight: 600; margin: 8px 0 4px; }
+  .finding { padding: 6px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+  .finding small { color: var(--muted); display: block; }
+  .sev { display: inline-block; min-width: 4.2em; font-weight: 600; text-transform: uppercase; font-size: .75rem; }
+  .row { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; margin: 8px 0; }
+  @media (max-width: 520px) { .row { grid-template-columns: 1fr; } }
   @media (max-width: 520px) { form { grid-template-columns: 1fr; } dl { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -63,14 +69,61 @@
     <p class="meaning">Choose the package you downloaded (the .tgz for npm, or the extension ZIP). It is hashed in your browser and never uploaded.</p>
     <input id="file" type="file" aria-label="Package file">
     <p id="fileResult" aria-live="polite"></p>
+    <div id="fileReview" aria-live="polite"></div>
+  </div>
+
+  <div class="card" id="reviewCard">
+    <h2>Watchtower: what does a release change?</h2>
+    <p class="meaning">Drop a package and it is compared with the version before it. It looks only at what is <em>new</em>: install scripts, credential reads, network calls, obfuscated blobs, new executables. Everything runs in your browser; nothing is uploaded.</p>
+    <div class="row">
+      <div><label for="rvNew">New release (.tgz)</label><input id="rvNew" type="file" accept=".tgz,.tar.gz"></div>
+      <div><label for="rvOld">Earlier version (.tgz, optional)</label><input id="rvOld" type="file" accept=".tgz,.tar.gz"></div>
+    </div>
+    <p class="meaning" id="rvHint">With a package name below, the earlier version is fetched from the npm registry for you.</p>
+    <div><label for="rvName">npm package name (optional)</label><input id="rvName" type="text" placeholder="@scope/name" autocomplete="off"></div>
+    <div id="rvOut" aria-live="polite" style="margin-top:12px"></div>
   </div>
 </main>
 
 <script type="module">
 import { RPC, rpcView, summarize, sha256Hex, formatDuration } from './keyturn.js';
+import { fetchPrevious, reviewPackage } from './lib/review.js';
 
 const $ = (id) => document.getElementById(id);
 let approvedHash = null;
+let looked = { project: '', version: '' };
+
+const VERDICT = {
+  flag: ['bad', 'Flag it. This release adds high-risk behaviour.'],
+  review: ['warn', 'Worth a human look. This release adds behaviour that is sometimes fine and sometimes not.'],
+  ok: ['ok', 'Nothing risky is new in this release.'],
+};
+
+function showReport({ report, comparedWith }) {
+  const [cls, line] = VERDICT[report.verdict];
+  const base = comparedWith ? `compared with ${esc(comparedWith)}` : 'no earlier version to compare with, so code findings are only hints';
+  const rows = report.findings
+    .map((f) => `<div class="finding"><span class="sev ${f.severity === 'high' ? 'bad' : f.severity === 'medium' ? 'warn' : ''}">${esc(f.severity)}</span> <b>${esc(f.rule)}</b>: ${esc(f.detail)}${f.path ? `<small>${esc(f.path)}${f.line ? ':' + f.line : ''}${f.snippet ? ' &nbsp; ' + esc(f.snippet) : ''}</small>` : ''}</div>`)
+    .join('');
+  return `<p class="verdict ${cls}">${esc(report.verdict.toUpperCase())}</p><p class="meaning">${esc(line)} (${base})</p>${rows}`;
+}
+
+async function review(file, name, version, previousFile) {
+  let previous = null;
+  let note = '';
+  if (previousFile) {
+    previous = { version: previousFile.name, bytes: new Uint8Array(await previousFile.arrayBuffer()) };
+  } else if (name) {
+    try {
+      previous = await fetchPrevious({ name, version });
+      if (!previous) note = 'The earlier version could not be found on the registry. ';
+    } catch {
+      note = 'The registry could not be reached from this page. Pick the earlier version as a file. ';
+    }
+  }
+  const result = await reviewPackage(new Uint8Array(await file.arrayBuffer()), previous);
+  return (note ? `<p class="meaning">${esc(note)}</p>` : '') + showReport(result);
+}
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -102,6 +155,8 @@ $('form').addEventListener('submit', async (e) => {
   const out = $('out');
   $('fileCard').hidden = true;
   approvedHash = null;
+  looked = { project, version };
+  $('fileReview').innerHTML = '';
   if (!contract || !project) { out.innerHTML = '<div class="card"><p class="error">Give a contract and a project.</p></div>'; return; }
   out.innerHTML = '<div class="card"><p>Looking up…</p></div>';
   try {
@@ -135,7 +190,28 @@ $('file').addEventListener('change', async (e) => {
   r.textContent = match
     ? 'Match. This file is exactly what the quorum approved.'
     : `Different. This file hashes to ${hash}, but the quorum approved ${approvedHash}.`;
+  const name = looked.project.startsWith('npm:') ? looked.project.slice(4) : '';
+  if (!name || !/.(tgz|gz)$/i.test(f.name)) { $('fileReview').innerHTML = ''; return; }
+  $('fileReview').innerHTML = '<p class="meaning">Running Watchtower on it…</p>';
+  try {
+    $('fileReview').innerHTML = await review(f, name, looked.version, null);
+  } catch (err) {
+    $('fileReview').innerHTML = `<p class="error">Watchtower could not read this file: ${esc(err.message || err)}</p>`;
+  }
 });
+
+async function runStandalone() {
+  const f = $('rvNew').files[0];
+  if (!f) return;
+  $('rvOut').innerHTML = '<p class="meaning">Reading…</p>';
+  try {
+    $('rvOut').innerHTML = await review(f, $('rvName').value.trim(), '', $('rvOld').files[0] || null);
+  } catch (err) {
+    $('rvOut').innerHTML = `<p class="error">Could not read this file: ${esc(err.message || err)}</p>`;
+  }
+}
+for (const id of ['rvNew', 'rvOld']) $(id).addEventListener('change', runStandalone);
+$('rvName').addEventListener('change', runStandalone);
 </script>
 </body>
 </html>
