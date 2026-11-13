@@ -19,8 +19,17 @@
 
 use near_sdk::json_types::U128;
 use near_sdk::store::LookupMap;
-use near_sdk::{env, near, require, AccountId, NearToken, PanicOnDefault, Promise};
+use near_sdk::{env, near, require, AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseError};
 use std::collections::HashSet;
+
+/// Raw storage key for the OutLayer settings. Kept outside the contract struct so that
+/// adding it needs no state migration. The one-letter prefixes of the maps never collide with it.
+const OUTLAYER_KEY: &[u8] = b"outlayer";
+/// What a hand-off must at least carry. OutLayer estimated about 0.007 NEAR for one run.
+const MIN_HANDOFF_YOCTO: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR
+const OUTLAYER_GAS: Gas = Gas::from_tgas(100);
+const CALLBACK_GAS: Gas = Gas::from_tgas(40);
+const MAX_RESULT_LEN: usize = 4096;
 
 const MIN_FLAG_BOND_YOCTO: u128 = 100_000_000_000_000_000_000_000; // 0.1 NEAR
 const MAX_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -84,6 +93,20 @@ pub struct Release {
     pub reject_votes: Vec<AccountId>,
     pub recall_votes: Vec<AccountId>,
     pub released_at_ms: Option<u64>,
+}
+
+/// Which OutLayer project is allowed to publish for this contract, and where its
+/// secrets live. Set once by the contract account and never changed afterwards, so nobody
+/// can later point the contract at a worker that merely echoes the approved hash.
+#[near(serializers=[borsh, json])]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct OutlayerConfig {
+    /// The OutLayer contract, for example `outlayer.testnet`.
+    pub contract: AccountId,
+    /// The deployed worker, `owner/name`.
+    pub project: String,
+    pub secrets_profile: String,
+    pub secrets_account: AccountId,
 }
 
 /// Accounts, separate from the members, that can start a recovery.
@@ -180,6 +203,33 @@ fn same_guardians(a: &Guardians, b: &Guardians) -> bool {
 
 fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// What the worker prints (see `Output` in the worker crate).
+struct WorkerOutput {
+    ok: bool,
+    published_hash: Option<String>,
+    error: Option<String>,
+    detail: Option<String>,
+}
+
+fn worker_output_from(v: &near_sdk::serde_json::Value) -> Option<WorkerOutput> {
+    let o = v.as_object()?;
+    let ok = o.get("ok")?.as_bool()?;
+    let text = |k: &str| o.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
+    Some(WorkerOutput { ok, published_hash: text("published_hash"), error: text("error"), detail: text("detail") })
+}
+
+/// OutLayer hands the callback the worker's stdout. Accept it as the JSON object itself or as
+/// a JSON string that holds that object.
+fn parse_worker_output(bytes: &[u8]) -> Option<WorkerOutput> {
+    let v: near_sdk::serde_json::Value = near_sdk::serde_json::from_slice(bytes).ok()?;
+    match &v {
+        near_sdk::serde_json::Value::String(s) => {
+            worker_output_from(&near_sdk::serde_json::from_str::<near_sdk::serde_json::Value>(s).ok()?)
+        }
+        other => worker_output_from(other),
+    }
 }
 
 fn emit(event: &str, data: near_sdk::serde_json::Value) {
@@ -441,6 +491,137 @@ impl Keyturn {
         );
     }
 
+    /// One-time setup of the OutLayer worker this contract may use. Only the contract
+    /// account itself can call it, and only once.
+    pub fn set_outlayer(&mut self, config: OutlayerConfig) {
+        require!(
+            env::predecessor_account_id() == env::current_account_id(),
+            "only the contract account can set this"
+        );
+        require!(!env::storage_has_key(OUTLAYER_KEY), "the OutLayer settings are already set");
+        require!(config.project.contains('/'), "project must look like owner/name");
+        env::storage_write(OUTLAYER_KEY, &near_sdk::borsh::to_vec(&config).unwrap());
+        emit(
+            "outlayer_set",
+            near_sdk::serde_json::json!({ "contract": config.contract, "project": config.project }),
+        );
+    }
+
+    pub fn get_outlayer(&self) -> Option<OutlayerConfig> {
+        Self::outlayer_config()
+    }
+
+    /// Hand a release that is `Executing` to the OutLayer worker. The contract builds the
+    /// worker's request itself from the approved hash it stores, so the caller can only choose
+    /// where the tarball is downloaded from; the worker refuses any file whose SHA-256 differs.
+    /// Anyone may call it. Attach at least 0.01 NEAR; OutLayer refunds what it does not use to
+    /// the caller. When the worker reports the published hash, `on_publish_result` marks the
+    /// release `Released` if that hash equals the approved one.
+    #[payable]
+    pub fn request_publish(&mut self, project_id: String, version: String, artifact_url: String) -> Promise {
+        let config = Self::outlayer_config().unwrap_or_else(|| env::panic_str("the OutLayer settings are not set"));
+        let deposit = env::attached_deposit();
+        require!(deposit.as_yoctonear() >= MIN_HANDOFF_YOCTO, "attach at least 0.01 NEAR for the OutLayer run");
+        require!(
+            artifact_url.starts_with("https://") && artifact_url.len() <= 2048,
+            "artifact_url must be an https URL"
+        );
+        let project = self.project(&project_id);
+        let key = release_key(&project_id, &version);
+        let release = self.release_mut(&key);
+        require!(release.status == Status::Executing, "release is not executing");
+        let approved_hash = release.artifact_hash.clone();
+        let mode = match project.registry {
+            Registry::Npm => "publish",
+            Registry::Chrome => "chrome",
+        };
+        let package = project_id.split_once(':').map(|(_, rest)| rest).unwrap_or(&project_id);
+        let input = near_sdk::serde_json::json!({
+            "mode": mode,
+            "package": package,
+            "version": version,
+            "approved_hash": approved_hash,
+            "artifact_url": artifact_url,
+        })
+        .to_string();
+        let args = near_sdk::serde_json::json!({
+            "source": { "Project": { "project_id": config.project, "version_key": null } },
+            "resource_limits": { "max_instructions": 2_000_000_000u64, "max_memory_mb": 128, "max_execution_seconds": 60 },
+            "input_data": input,
+            "secrets_ref": { "profile": config.secrets_profile, "account_id": config.secrets_account },
+            "response_format": "Json",
+            "payer_account_id": env::predecessor_account_id(),
+        });
+        emit(
+            "publish_requested",
+            near_sdk::serde_json::json!({ "project": project_id, "version": version, "by": env::predecessor_account_id() }),
+        );
+        Promise::new(config.contract)
+            .function_call("request_execution".to_string(), args.to_string().into_bytes(), deposit, OUTLAYER_GAS)
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(CALLBACK_GAS)
+                    .on_publish_result(project_id, version),
+            )
+    }
+
+    /// Receives the worker's answer from OutLayer. Only this contract can call it.
+    #[private]
+    pub fn on_publish_result(&mut self, project_id: String, version: String) -> bool {
+        let key = release_key(&project_id, &version);
+        let bytes = match env::promise_result_checked(0, MAX_RESULT_LEN) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let why = match e {
+                    PromiseError::Failed => "the OutLayer call failed",
+                    PromiseError::TooLong(_) => "the OutLayer answer was too long",
+                    _ => "the OutLayer call did not return a result",
+                };
+                emit("publish_failed", near_sdk::serde_json::json!({ "project": project_id, "version": version, "error": why }));
+                return false;
+            }
+        };
+        let out = parse_worker_output(&bytes);
+        let release = self.release_mut(&key);
+        if release.status != Status::Executing {
+            return false;
+        }
+        match out {
+            Some(WorkerOutput { ok: true, published_hash: Some(hash), .. }) if hash == release.artifact_hash => {
+                release.status = Status::Released;
+                release.released_at_ms = Some(env::block_timestamp_ms());
+                emit(
+                    "release_published",
+                    near_sdk::serde_json::json!({ "project": project_id, "version": version, "hash": hash, "via": "outlayer" }),
+                );
+                true
+            }
+            Some(WorkerOutput { ok: true, published_hash, .. }) => {
+                emit(
+                    "publish_failed",
+                    near_sdk::serde_json::json!({ "project": project_id, "version": version, "error": "hash_mismatch", "got": published_hash }),
+                );
+                false
+            }
+            Some(WorkerOutput { error, detail, .. }) => {
+                // "pending" is not a failure: the registry is still processing. Ask again.
+                emit(
+                    "publish_failed",
+                    near_sdk::serde_json::json!({ "project": project_id, "version": version, "error": error, "detail": detail }),
+                );
+                false
+            }
+            None => {
+                let raw: String = String::from_utf8_lossy(&bytes).chars().take(300).collect();
+                emit(
+                    "publish_failed",
+                    near_sdk::serde_json::json!({ "project": project_id, "version": version, "error": "unreadable_answer", "raw": raw }),
+                );
+                false
+            }
+        }
+    }
+
     /// Members vote to recall a published release.
     pub fn recall_release(&mut self, project_id: String, version: String) {
         let project = self.project(&project_id);
@@ -601,6 +782,10 @@ impl Keyturn {
 }
 
 impl Keyturn {
+    fn outlayer_config() -> Option<OutlayerConfig> {
+        env::storage_read(OUTLAYER_KEY).and_then(|b| near_sdk::borsh::from_slice(&b).ok())
+    }
+
     fn guardians_of(&self, id: &str) -> Guardians {
         self.guardians
             .get(&id.to_string())
@@ -1074,5 +1259,203 @@ mod tests {
         }));
         assert!(blocked.is_err(), "the old members are gone, so their approvals no longer count");
         assert_eq!(rel(&c, "1.0.0").status, Status::Pending);
+    }
+
+    // ---- OutLayer hand-off -------------------------------------------------
+
+    const OL_URL: &str = "https://example.test/pkg.tgz";
+    const MIN_DEPOSIT: u128 = 20_000_000_000_000_000_000_000; // 0.02 NEAR
+
+    fn ol_config() -> OutlayerConfig {
+        OutlayerConfig {
+            contract: acct("outlayer.test"),
+            project: "owner.test/keyturn-worker".to_string(),
+            secrets_profile: "default".to_string(),
+            secrets_account: acct("owner.test"),
+        }
+    }
+
+    fn configured() -> Keyturn {
+        let mut c = setup(&["ada.test", "bob.test"], 2);
+        // The contract account is the only one that may set the worker project.
+        testing_env!(VMContextBuilder::new()
+            .current_account_id(acct("keyturn.test"))
+            .predecessor_account_id(acct("keyturn.test"))
+            .build());
+        c.set_outlayer(ol_config());
+        c
+    }
+
+    fn executing(c: &mut Keyturn) {
+        propose(c, "1.0.0");
+        call_as("ada.test", 3_000, || c.approve_release("npm:leftpad".into(), "1.0.0".into()));
+        call_as("bob.test", 4_000, || c.approve_release("npm:leftpad".into(), "1.0.0".into()));
+        call_as("anyone.test", 4_000 + DAY_MS, || c.execute_release("npm:leftpad".into(), "1.0.0".into()));
+        assert_eq!(rel(c, "1.0.0").status, Status::Executing);
+    }
+
+    /// Runs `f` as the contract itself, with one promise result available.
+    fn callback_with<R>(result: near_sdk::PromiseResult, f: impl FnOnce() -> R) -> R {
+        testing_env!(
+            VMContextBuilder::new()
+                .current_account_id(acct("keyturn.test"))
+                .predecessor_account_id(acct("keyturn.test"))
+                .build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![result]
+        );
+        f()
+    }
+
+    fn ok_answer(hash: &str) -> near_sdk::PromiseResult {
+        near_sdk::PromiseResult::Successful(
+            format!(r#"{{"ok":true,"published_hash":"{}"}}"#, hash).into_bytes(),
+        )
+    }
+
+    #[test]
+    fn outlayer_settings_are_set_once_and_only_by_the_contract() {
+        let mut c = configured();
+        assert_eq!(c.get_outlayer(), Some(ol_config()));
+        // A second call, even by the contract account, is refused.
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.set_outlayer(ol_config())));
+        assert!(again.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "only the contract account can set this")]
+    fn a_stranger_cannot_point_the_contract_at_another_worker() {
+        let mut c = setup(&["ada.test", "bob.test"], 2);
+        at("mallory.test", 5_000, 0);
+        c.set_outlayer(ol_config());
+    }
+
+    #[test]
+    #[should_panic(expected = "the OutLayer settings are not set")]
+    fn handoff_needs_the_settings() {
+        let mut c = setup(&["ada.test", "bob.test"], 2);
+        executing(&mut c);
+        at("anyone.test", 9_000_000_000, MIN_DEPOSIT);
+        let _ = c.request_publish("npm:leftpad".into(), "1.0.0".into(), OL_URL.into());
+    }
+
+    #[test]
+    #[should_panic(expected = "release is not executing")]
+    fn handoff_only_for_a_release_whose_window_has_passed() {
+        let mut c = configured();
+        propose(&mut c, "1.0.0");
+        at("anyone.test", 9_000, MIN_DEPOSIT);
+        let _ = c.request_publish("npm:leftpad".into(), "1.0.0".into(), OL_URL.into());
+    }
+
+    #[test]
+    #[should_panic(expected = "attach at least 0.01 NEAR")]
+    fn handoff_needs_a_deposit() {
+        let mut c = configured();
+        executing(&mut c);
+        at("anyone.test", 9_000_000_000, 0);
+        let _ = c.request_publish("npm:leftpad".into(), "1.0.0".into(), OL_URL.into());
+    }
+
+    #[test]
+    #[should_panic(expected = "artifact_url must be an https URL")]
+    fn handoff_refuses_plain_http() {
+        let mut c = configured();
+        executing(&mut c);
+        at("anyone.test", 9_000_000_000, MIN_DEPOSIT);
+        let _ = c.request_publish("npm:leftpad".into(), "1.0.0".into(), "http://example.test/x.tgz".into());
+    }
+
+    #[test]
+    fn handoff_sends_one_call_to_outlayer_with_the_approved_hash() {
+        let mut c = configured();
+        executing(&mut c);
+        at("anyone.test", 9_000_000_000, MIN_DEPOSIT);
+        let _ = c.request_publish("npm:leftpad".into(), "1.0.0".into(), OL_URL.into());
+        let receipts = near_sdk::test_utils::get_created_receipts();
+        let text = format!("{:?}", receipts);
+        // The mock prints method names and arguments as byte lists.
+        let has = |needle: &str| {
+            let bytes: Vec<String> = needle.bytes().map(|b| b.to_string()).collect();
+            text.contains(&bytes.join(", "))
+        };
+        assert!(text.contains("outlayer.test"), "the call goes to the OutLayer contract");
+        assert!(has("request_execution"));
+        assert!(has("on_publish_result"));
+        // The worker's request is built by the contract: the caller cannot choose the hash.
+        assert!(has(HASH), "the approved hash is in the request");
+        assert!(has("owner.test/keyturn-worker"));
+        assert!(has(OL_URL));
+    }
+
+    #[test]
+    fn callback_releases_when_the_worker_reports_the_approved_hash() {
+        let mut c = configured();
+        executing(&mut c);
+        let released = callback_with(ok_answer(HASH), || c.on_publish_result("npm:leftpad".into(), "1.0.0".into()));
+        assert!(released);
+        assert_eq!(rel(&c, "1.0.0").status, Status::Released);
+        assert!(c.is_released("npm:leftpad".into(), "1.0.0".into(), HASH.into()));
+    }
+
+    #[test]
+    fn callback_accepts_the_answer_wrapped_in_a_json_string() {
+        let mut c = configured();
+        executing(&mut c);
+        let inner = format!(r#"{{"ok":true,"published_hash":"{}"}}"#, HASH);
+        let wrapped = near_sdk::serde_json::to_vec(&inner).unwrap();
+        let released = callback_with(near_sdk::PromiseResult::Successful(wrapped), || {
+            c.on_publish_result("npm:leftpad".into(), "1.0.0".into())
+        });
+        assert!(released);
+    }
+
+    #[test]
+    fn callback_does_not_release_on_a_different_hash() {
+        let mut c = configured();
+        executing(&mut c);
+        let released = callback_with(ok_answer(OTHER_HASH), || c.on_publish_result("npm:leftpad".into(), "1.0.0".into()));
+        assert!(!released);
+        assert_eq!(rel(&c, "1.0.0").status, Status::Executing);
+    }
+
+    #[test]
+    fn callback_keeps_executing_when_the_worker_says_pending_or_fails() {
+        let mut c = configured();
+        executing(&mut c);
+        for body in [
+            r#"{"ok":false,"error":"pending","detail":"still processing"}"#,
+            r#"{"ok":false,"error":"hash_mismatch","detail":"x"}"#,
+            "not json at all",
+            r#"{"ok":true}"#,
+        ] {
+            let released = callback_with(near_sdk::PromiseResult::Successful(body.as_bytes().to_vec()), || {
+                c.on_publish_result("npm:leftpad".into(), "1.0.0".into())
+            });
+            assert!(!released, "{body}");
+            assert_eq!(rel(&c, "1.0.0").status, Status::Executing, "{body}");
+        }
+    }
+
+    #[test]
+    fn callback_keeps_executing_when_the_outlayer_call_failed() {
+        let mut c = configured();
+        executing(&mut c);
+        let released = callback_with(near_sdk::PromiseResult::Failed, || {
+            c.on_publish_result("npm:leftpad".into(), "1.0.0".into())
+        });
+        assert!(!released);
+        assert_eq!(rel(&c, "1.0.0").status, Status::Executing);
+    }
+
+    #[test]
+    fn a_second_answer_cannot_release_twice_or_resurrect_a_recalled_release() {
+        let mut c = configured();
+        executing(&mut c);
+        assert!(callback_with(ok_answer(HASH), || c.on_publish_result("npm:leftpad".into(), "1.0.0".into())));
+        let again = callback_with(ok_answer(HASH), || c.on_publish_result("npm:leftpad".into(), "1.0.0".into()));
+        assert!(!again);
     }
 }

@@ -72,6 +72,10 @@ export function summarize(project, release, nowMs = Date.now()) {
     windowRemainingMs: release.status === 'Pending' && waitMs > 0 ? waitMs : 0,
     flag: release.flag,
     registry: project.registry,
+    readyAtMs: release.ready_at_ms ?? null,
+    dismissVotes: release.dismiss_votes || [],
+    rejectVotes: release.reject_votes || [],
+    recallVotes: release.recall_votes || [],
   };
 }
 

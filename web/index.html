@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Keyturn — Release explorer</title>
-<meta name="description" content="Look up release approvals on NEAR, verify exact package bytes, and review changes with Watchtower.">
+<meta name="description" content="Look up release approvals on NEAR, act on them with your wallet, verify exact package bytes, and review changes with Watchtower.">
 <meta name="theme-color" content="#11120f">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2311120f'/%3E%3Ccircle cx='11' cy='16' r='6' fill='none' stroke='%23dcff43' stroke-width='3'/%3E%3Cpath d='M17 16h11m-3 0v5' fill='none' stroke='%23dcff43' stroke-width='3'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="./signal-board.css">
@@ -27,7 +27,7 @@
     <a class="nav-link" href="#verify">Verify</a>
     <a class="nav-link" href="#watchtower">Watchtower</a>
   </nav>
-  <div class="header-badges"><span class="badge" id="networkBadge">Testnet</span><span class="badge badge-lime">Read only</span></div>
+  <div class="header-badges"><span class="badge" id="networkBadge">Testnet</span><button type="button" class="wallet-btn" id="walletBtn" aria-live="polite">Connect wallet</button></div>
 </header>
 <main>
   <section class="release-overview" id="releases" aria-labelledby="pageTitle">
@@ -43,7 +43,7 @@
         </div>
         <div class="lookup-meta"><label for="contract">Contract</label><input id="contract" type="text" value="contract.hudich-keyturn.testnet" autocomplete="off" spellcheck="false"><span class="meta-note">Onchain record</span></div>
       </form>
-      <p class="lookup-note">Check a release against the contract. This page only reads the chain and holds no keys.</p>
+      <p class="lookup-note">Check a release against the contract. This page holds no keys: reading needs nothing, and acting happens in your own NEAR wallet.</p>
     </div>
     <aside class="status-panel" aria-label="Release status">
       <div class="panel-kicker"><span>Release status</span><span class="live-label"><i></i> Onchain</span></div>
@@ -59,6 +59,8 @@
   </section>
 
   <section class="release-evidence panel-light" id="releaseEvidence" aria-label="Release evidence" hidden></section>
+
+  <section class="actions-panel panel-light" id="actions" aria-labelledby="actionsTitle" hidden></section>
 
   <div class="tools-grid">
     <section class="verify-panel panel-light" id="verify" aria-labelledby="verifyTitle">
@@ -98,10 +100,13 @@
 <script type="module">
 import { RPC, rpcView, summarize, sha256Hex, formatDuration } from './keyturn.js';
 import { fetchPrevious, reviewPackage } from './lib/review.js';
+import { availableActions, checkInput, buildRequest } from './actions.js';
+import { createWallet, eventsFromOutcome, wasConnected } from './wallet.js';
 
 const $ = (id) => document.getElementById(id);
 let approvedHash = null;
 let looked = { project: '', version: '' };
+let current = null; // the release on screen: { summary, contract, project, version, handoffReady }
 
 const VERDICT = {
   flag: ['bad', 'Flag it. This release adds high-risk behaviour.'],
@@ -202,30 +207,42 @@ document.querySelectorAll('.nav-link').forEach((link) => {
   });
 });
 
-$('form').addEventListener('submit', async (e) => {
-  e.preventDefault();
+async function lookup({ quiet = false } = {}) {
   const contract = $('contract').value.trim();
   const project = $('project').value.trim();
   const version = $('version').value.trim();
   const out = $('out');
-  resetReleasePresentation();
-  $('fileCard').hidden = true;
-  approvedHash = null;
+  if (!quiet) {
+    resetReleasePresentation();
+    $('fileCard').hidden = true;
+    approvedHash = null;
+    $('fileReview').innerHTML = '';
+  }
+  current = null;
+  $('actions').hidden = true;
   looked = { project, version };
-  $('fileReview').innerHTML = '';
   if (!contract || !project) { out.innerHTML = '<div class="card"><p class="error">Give a contract and a project.</p></div>'; return; }
-  out.innerHTML = '<div class="card"><p>Looking up…</p></div>';
+  if (!quiet) out.innerHTML = '<div class="card"><p>Looking up…</p></div>';
   try {
     const net = contract.endsWith('.near') ? 'mainnet' : 'testnet';
     const proj = await rpcView({ rpc: RPC[net], contract, method: 'get_project', args: { project_id: project } });
     const rel = version ? await rpcView({ rpc: RPC[net], contract, method: 'get_release', args: { project_id: project, version } }) : null;
     const summary = proj && !version ? { found: true, message: 'Give a version to see its release.' } : summarize(proj, rel);
     out.innerHTML = show(summary);
-    if (summary.hash) { approvedHash = summary.hash; $('fileCard').hidden = false; $('fileResult').textContent = ''; }
+    if (summary.hash && !quiet) { approvedHash = summary.hash; $('fileCard').hidden = false; $('fileResult').textContent = ''; }
+    if (summary.status) {
+      let handoffReady = false;
+      if (summary.status === 'Executing') {
+        try { handoffReady = Boolean(await rpcView({ rpc: RPC[net], contract, method: 'get_outlayer' })); } catch { handoffReady = false; }
+      }
+      current = { summary, contract, project, version, handoffReady, net };
+      renderActions();
+    }
   } catch (err) {
     out.innerHTML = `<div class="card"><p class="error">${esc(err.message || err)}</p></div>`;
   }
-});
+}
+$('form').addEventListener('submit', (e) => { e.preventDefault(); lookup(); });
 
 // A link like ?project=npm:name&version=1.0.0 runs the lookup straight away.
 const params = new URLSearchParams(location.search);
@@ -236,6 +253,111 @@ if (params.get('project')) {
   $('version').value = params.get('version') || '';
   $('form').requestSubmit();
 }
+
+// ---- Acting on a release with a wallet --------------------------------------------------
+let wallet = null;
+const busy = new Set();
+const explorer = (net, tx) => `https://${net === 'mainnet' ? '' : 'testnet.'}nearblocks.io/txns/${tx}`;
+
+function getWallet() {
+  const net = $('contract').value.trim().endsWith('.near') ? 'mainnet' : 'testnet';
+  if (!wallet || wallet.network !== net) wallet = createWallet({ network: net, onChange: renderWallet });
+  return wallet;
+}
+
+function renderWallet(account) {
+  const b = $('walletBtn');
+  b.textContent = account ? account : 'Connect wallet';
+  b.title = account ? 'Connected. Click to disconnect.' : 'Connect a NEAR wallet to act on a release';
+  b.dataset.connected = String(Boolean(account));
+  renderActions();
+}
+
+function renderActions({ message = '' } = {}) {
+  const box = $('actions');
+  if (!current) { box.hidden = true; return; }
+  const account = wallet?.account() || null;
+  const list = availableActions({ summary: current.summary, account, handoffReady: current.handoffReady });
+  if (!list.length) { box.hidden = true; return; }
+  const keep = Object.fromEntries([...box.querySelectorAll('input[data-for]')].map((i) => [i.dataset.for, i.value]));
+  box.hidden = false;
+  box.innerHTML = `<div class="evidence-heading"><h2 id="actionsTitle">Act on this release</h2><span class="small-label">${account ? 'Signed in your wallet' : 'Needs a NEAR wallet'}</span></div>
+    <p class="meaning">${account ? `Connected as <b>${esc(account)}</b>. Every button sends one transaction that your wallet asks you to approve; the contract checks the rules again.` : 'These actions are sent from your own wallet. Nothing is signed here.'}</p>
+    <div class="action-list">${list.map((a) => `<div class="action" data-action="${a.id}">
+      <div class="action-text"><strong>${esc(a.label)}</strong><p>${esc(a.note || '')}</p>
+      ${a.needs === 'reason' ? `<label for="in-${a.id}">Reason</label><input id="in-${a.id}" data-for="${a.id}" type="text" maxlength="500" placeholder="What is wrong with this release?" autocomplete="off" value="${esc(keep[a.id] || '')}">` : ''}
+      ${a.needs === 'artifactUrl' ? `<label for="in-${a.id}">Where the worker downloads the file (https)</label><input id="in-${a.id}" data-for="${a.id}" type="text" placeholder="https://…/package.tgz" autocomplete="off" spellcheck="false" value="${esc(keep[a.id] || '')}">` : ''}</div>
+      <button type="button" data-run="${a.id}" ${a.can && !busy.has(a.id) ? '' : 'disabled'}>${busy.has(a.id) ? 'Waiting…' : esc(a.label)}</button></div>`).join('')}</div>
+    <p class="action-message" id="actionMessage" aria-live="polite">${message}</p>`;
+}
+
+function setMessage(html) {
+  const m = $('actionMessage');
+  if (m) m.innerHTML = html;
+}
+
+async function runAction(id) {
+  if (!current || busy.has(id)) return;
+  const account = wallet?.account() || null;
+  const action = availableActions({ summary: current.summary, account, handoffReady: current.handoffReady }).find((a) => a.id === id);
+  if (!action || !action.can) return;
+  const input = $('actions').querySelector(`input[data-for="${id}"]`);
+  const value = input ? input.value : '';
+  const problem = checkInput(action, value);
+  if (problem) { setMessage(`<span class="bad">${esc(problem)}</span>`); input?.focus(); return; }
+  const { contract, project, version, net } = current;
+  busy.add(id);
+  renderActions({ message: 'Approve the transaction in your wallet…' });
+  try {
+    const outcome = await wallet.send(buildRequest({ contract, project, version, action, value }));
+    const tx = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+    const link = tx ? ` <a href="${explorer(net, tx)}" target="_blank" rel="noopener">View transaction</a>` : '';
+    const said = eventsFromOutcome(outcome).find((e) => e.event === 'publish_failed');
+    busy.delete(id);
+    await lookup({ quiet: true });
+    let note = said
+      ? `OutLayer answered: <b>${esc(said.data.error || 'failed')}</b>${said.data.detail ? ` (${esc(said.data.detail)})` : ''}. The release stays Executing; ${said.data.error === 'pending' ? 'ask again in a minute, the worker never publishes twice' : 'check the URL and try again'}.`
+      : 'Done. The record above is refreshed from the chain.';
+    if (id === 'handoff' && !said) note = 'Sent. OutLayer is running the worker; this page refreshes when the contract records the result.';
+    renderActions({ message: note + link });
+    if (id === 'handoff' && !said) watchUntilReleased(link);
+  } catch (err) {
+    busy.delete(id);
+    renderActions({ message: `<span class="bad">${esc(err?.message || String(err))}</span>` });
+  }
+}
+
+// After a hand-off OutLayer answers on its own a few seconds later. Look again until the contract moves on.
+async function watchUntilReleased(link) {
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 6000));
+    if (!current || current.summary.status !== 'Executing') return;
+    await lookup({ quiet: true });
+    if (current && current.summary.status !== 'Executing') {
+      renderActions({ message: `The contract recorded the result: <b>${esc(current.summary.status)}</b>.${link}` });
+      return;
+    }
+    renderActions({ message: `Waiting for OutLayer… ${link}` });
+  }
+}
+
+$('actions').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-run]');
+  if (b) runAction(b.dataset.run);
+});
+
+$('walletBtn').addEventListener('click', async () => {
+  const w = getWallet();
+  try {
+    if (w.account()) await w.disconnect();
+    else await w.connect();
+  } catch (err) {
+    setMessage(`<span class="bad">${esc(err?.message || String(err))}</span>`);
+    $('walletBtn').textContent = 'Connect wallet';
+  }
+});
+
+if (wasConnected()) getWallet().restore().catch(() => {});
 
 $('file').addEventListener('change', async (e) => {
   const f = e.target.files[0];

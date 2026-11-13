@@ -51,4 +51,31 @@ export class NearChain {
       gas,
     });
   }
+
+  /**
+   * Like `call` but returns the whole outcome (logs of every receipt, the transaction hash).
+   * `waitUntil` defaults to INCLUDED so a call that waits on another contract does not block.
+   */
+  async callRaw(method, args = {}, { deposit = 0n, gas = DEFAULT_GAS, waitUntil = 'INCLUDED' } = {}) {
+    if (!this.account) throw new Error('signing needs KEYTURN_ACCOUNT and a key');
+    return this.account.callFunctionRaw({ contractId: this.contractId, methodName: method, args, deposit, gas, waitUntil });
+  }
+
+  /** The EVENT_JSON lines a finished transaction logged, in order. */
+  async events(txHash, signerId) {
+    const tx = await this.provider.viewTransactionStatus({ txHash, accountId: signerId, waitUntil: 'FINAL' });
+    const out = [];
+    for (const r of tx.receipts_outcome || []) {
+      for (const line of r.outcome.logs || []) {
+        if (line.startsWith('EVENT_JSON:')) {
+          try {
+            out.push(JSON.parse(line.slice('EVENT_JSON:'.length)));
+          } catch {
+            /* not ours */
+          }
+        }
+      }
+    }
+    return out;
+  }
 }
