@@ -3,6 +3,7 @@ import { parseArgs } from 'node:util';
 import { NearChain } from './chain.mjs';
 import * as cmd from './commands.mjs';
 import { parseTarget } from './util.mjs';
+import { attest } from './attest.mjs';
 
 const HELP = `keyturn <command> [options]
 
@@ -37,6 +38,10 @@ Commands:
   watch     <project>@<version> --tarball file.tgz [--previous old.tgz | --registry URL] [--flag] [--bond 0.1] [--ai]
             analyse the approved bytes against the previous version; with --flag, flag a risky release in its public window
             --ai adds a second opinion from NEAR AI Cloud (NEAR_AI_API_KEY and KEYTURN_AI_MODEL)
+  attest    <tx hash> [--signer ACCOUNT] [--require-tee]
+            check a release that was published through OutLayer: the contract itself called it, the pinned build ran,
+            the approved hash was in the request, the contract recorded the answer; plus the Intel TDX quote through
+            outlayer-verify when it is installed. --signer is the account that signed the request_publish transaction.
   hash      <file>
 `;
 
@@ -62,6 +67,8 @@ const options = {
   'artifact-url': { type: 'string' },
   worker: { type: 'string' },
   json: { type: 'boolean' },
+  signer: { type: 'string' },
+  'require-tee': { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
 };
 
@@ -87,6 +94,18 @@ async function main() {
     accountId: v.account || process.env.KEYTURN_ACCOUNT,
     privateKey: process.env.KEYTURN_KEY,
   });
+
+  if (command === 'attest') {
+    if (!target) fail('attest needs the transaction hash of the request_publish call');
+    const r = await attest(chain, { txHash: target, signer: v.signer || process.env.KEYTURN_ACCOUNT });
+    for (const c of r.checks) console.log(`  ${c.ok === true ? 'PASS' : c.ok === false ? 'FAIL' : 'SKIP'}  ${c.text}`);
+    const strict = v['require-tee'] && !r.teeChecked;
+    const verdict = r.ok && !strict
+      ? `ATTESTED${r.teeChecked ? ' (including the TEE quote)' : ' (the TEE quote was not checked)'}`
+      : 'NOT ATTESTED';
+    console.log(`\n${verdict}`);
+    process.exit(r.ok && !strict ? 0 : 1);
+  }
 
   if (command === 'register') {
     await cmd.register(chain, {

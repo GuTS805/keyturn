@@ -24,7 +24,9 @@ use std::collections::HashSet;
 
 /// Raw storage key for the OutLayer settings. Kept outside the contract struct so that
 /// adding it needs no state migration. The one-letter prefixes of the maps never collide with it.
-const OUTLAYER_KEY: &[u8] = b"outlayer";
+const OUTLAYER_KEY: &[u8] = b"outlayer2";
+/// The first layout of the settings, before the build was pinned. Removed when the new ones are set.
+const OUTLAYER_KEY_V1: &[u8] = b"outlayer";
 /// What a hand-off must at least carry. OutLayer estimates about 0.013 NEAR for the limits below.
 const MIN_HANDOFF_YOCTO: u128 = 20_000_000_000_000_000_000_000; // 0.02 NEAR
 /// The worker does TLS and hashing in wasm. 2 billion instructions was too few: OutLayer killed
@@ -109,6 +111,10 @@ pub struct OutlayerConfig {
     pub contract: AccountId,
     /// The deployed worker, `owner/name`.
     pub project: String,
+    /// The exact build that may run: the SHA-256 of the worker wasm, which OutLayer uses as the
+    /// version key. Without it a project owner could activate another version and the contract
+    /// would call that one. Check it against `get_project` / `list_versions` on OutLayer.
+    pub version_key: String,
     pub secrets_profile: String,
     pub secrets_account: AccountId,
 }
@@ -504,10 +510,12 @@ impl Keyturn {
         );
         require!(!env::storage_has_key(OUTLAYER_KEY), "the OutLayer settings are already set");
         require!(config.project.contains('/'), "project must look like owner/name");
+        require!(is_sha256_hex(&config.version_key), "version_key must be the 64 hex characters of the worker wasm SHA-256");
+        env::storage_remove(OUTLAYER_KEY_V1);
         env::storage_write(OUTLAYER_KEY, &near_sdk::borsh::to_vec(&config).unwrap());
         emit(
             "outlayer_set",
-            near_sdk::serde_json::json!({ "contract": config.contract, "project": config.project }),
+            near_sdk::serde_json::json!({ "contract": config.contract, "project": config.project, "version_key": config.version_key }),
         );
     }
 
@@ -549,7 +557,7 @@ impl Keyturn {
         })
         .to_string();
         let args = near_sdk::serde_json::json!({
-            "source": { "Project": { "project_id": config.project, "version_key": null } },
+            "source": { "Project": { "project_id": config.project, "version_key": config.version_key } },
             "resource_limits": { "max_instructions": MAX_INSTRUCTIONS, "max_memory_mb": 128, "max_execution_seconds": MAX_SECONDS },
             "input_data": input,
             "secrets_ref": { "profile": config.secrets_profile, "account_id": config.secrets_account },
@@ -1267,6 +1275,7 @@ mod tests {
 
     // ---- OutLayer hand-off -------------------------------------------------
 
+    const WORKER_BUILD: &str = "f52458e9a998f1c5bb9802b61bca50c22cbc6bc60507e7e045631e32a444facd";
     const OL_URL: &str = "https://example.test/pkg.tgz";
     const MIN_DEPOSIT: u128 = 20_000_000_000_000_000_000_000; // 0.02 NEAR
 
@@ -1274,6 +1283,7 @@ mod tests {
         OutlayerConfig {
             contract: acct("outlayer.test"),
             project: "owner.test/keyturn-worker".to_string(),
+            version_key: WORKER_BUILD.to_string(),
             secrets_profile: "default".to_string(),
             secrets_account: acct("owner.test"),
         }
@@ -1326,6 +1336,19 @@ mod tests {
         // A second call, even by the contract account, is refused.
         let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.set_outlayer(ol_config())));
         assert!(again.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "version_key must be")]
+    fn the_worker_build_must_be_a_sha256() {
+        let mut c = setup(&["ada.test", "bob.test"], 2);
+        testing_env!(VMContextBuilder::new()
+            .current_account_id(acct("keyturn.test"))
+            .predecessor_account_id(acct("keyturn.test"))
+            .build());
+        let mut cfg = ol_config();
+        cfg.version_key = "latest".to_string();
+        c.set_outlayer(cfg);
     }
 
     #[test]
@@ -1391,6 +1414,8 @@ mod tests {
         // The worker's request is built by the contract: the caller cannot choose the hash.
         assert!(has(HASH), "the approved hash is in the request");
         assert!(has("owner.test/keyturn-worker"));
+        // The build is pinned: an owner who activates another version cannot change what runs.
+        assert!(has(WORKER_BUILD), "the pinned worker build is in the request");
         assert!(has(OL_URL));
     }
 

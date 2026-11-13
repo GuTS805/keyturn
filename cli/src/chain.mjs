@@ -30,6 +30,7 @@ export class NearChain {
     this.contractId = contractId;
     this.accountId = accountId;
     this.network = network;
+    this.rpcUrl = rpcUrl || RPC[network];
     this.provider = new JsonRpcProvider({ url: rpcUrl || RPC[network] });
     const key = privateKey || (accountId ? keyFromCredentialsFile(network, accountId) : undefined);
     this.account = accountId && key ? new Account(accountId, this.provider, key) : undefined;

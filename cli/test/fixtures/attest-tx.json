@@ -1,0 +1,54 @@
+{
+ "transaction": {
+  "hash": "5gSCtV4y52xM7vAoH9TwYiTKd9vxv3f8tuRG3m78GVDJ",
+  "signer_id": "watch.hudich-keyturn.testnet",
+  "receiver_id": "contract.hudich-keyturn.testnet",
+  "actions": [
+   {
+    "FunctionCall": {
+     "args": "eyJwcm9qZWN0X2lkIjoibnBtOkBzY2FtbWVyb3AwOC9rZXl0dXJuLWRlbW8iLCJ2ZXJzaW9uIjoiMC4wLjQiLCJhcnRpZmFjdF91cmwiOiJodHRwczovL3Rlc3QuZmFzdGZzLmlvL2h1ZGljaC1rZXl0dXJuLnRlc3RuZXQvb3V0bGF5ZXIudGVzdG5ldC9hZjFmMDQzYzhiNGYwZTI5YTdjNzkwNzE0MGNlODIyYzdkYzE3MmRjY2UxMmM5MGUwMGY4Y2UyY2MwMWVjZjE0LnRneiJ9",
+     "deposit": "30000000000000000000000",
+     "gas": 250000000000000,
+     "method_name": "request_publish"
+    }
+   }
+  ]
+ },
+ "receipts_outcome": [
+  {
+   "outcome": {
+    "executor_id": "contract.hudich-keyturn.testnet",
+    "logs": [
+     "EVENT_JSON:{\"standard\":\"keyturn\",\"version\":\"1.0.0\",\"event\":\"publish_requested\",\"data\":{\"project\":\"npm:@scammerop08/keyturn-demo\",\"version\":\"0.0.4\",\"by\":\"watch.hudich-keyturn.testnet\"}}"
+    ]
+   }
+  },
+  {
+   "outcome": {
+    "executor_id": "outlayer.testnet",
+    "logs": [
+     "Resolved project: hudich-keyturn.testnet/keyturn-worker, version: \"f52458e9a998f1c5bb9802b61bca50c22cbc6bc60507e7e045631e32a444facd\", source: WasmUrl { url: \"https://test.fastfs.io/hudich-keyturn.testnet/outlayer.testnet/f52458e9a998f1c5bb9802b61bca50c22cbc6bc60507e7e045631e32a444facd.wasm\", hash: \"f52458e9a998f1c5bb9802b61bca50c22cbc6bc60507e7e045631e32a444facd\", build_target: Some(\"wasm32-wasip2\") }, uuid: p0000000000000166",
+     "EVENT_JSON:{\"standard\":\"near-outlayer\",\"version\":\"1.0.0\",\"event\":\"execution_requested\",\"data\":[{\"request_data\":\"{\\\"request_id\\\":40379,\\\"sender_id\\\":\\\"watch.hudich-keyturn.testnet\\\",\\\"predecessor_id\\\":\\\"contract.hudich-keyturn.testnet\\\",\\\"code_source\\\":{\\\"WasmUrl\\\":{\\\"url\\\":\\\"https://test.fastfs.io/hudich-keyturn.testnet/outlayer.testnet/f52458e9a998f1c5bb9802b61bca50c22cbc6bc60507e7e045631e32a444facd.wasm\\\",\\\"hash\\\":\\\"f52458e9a998f1c5bb9802b61bca50c22cbc6bc60507e7e045631e32a444facd\\\",\\\"build_target\\\":\\\"wasm32-wasip2\\\"}},\\\"resource_limits\\\":{\\\"max_instructions\\\":20000000000,\\\"max_memory_mb\\\":128,\\\"max_execution_seconds\\\":120},\\\"input_data\\\":\\\"{\\\\\\\"mode\\\\\\\":\\\\\\\"publish\\\\\\\",\\\\\\\"package\\\\\\\":\\\\\\\"@scammerop08/keyturn-demo\\\\\\\",\\\\\\\"version\\\\\\\":\\\\\\\"0.0.4\\\\\\\",\\\\\\\"approved_hash\\\\\\\":\\\\\\\"af1f043c8b4f0e29a7c7907140ce822c7dc172dcce12c90e00f8ce2cc01ecf14\\\\\\\",\\\\\\\"artifact_url\\\\\\\":\\\\\\\"https://test.fastfs.io/hudich-keyturn.testnet/outlayer.testnet/af1f043c8b4f0e29a7c7907140ce822c7dc172dcce12c90e00f8ce2cc01ecf14.tgz\\\\\\\"}\\\",\\\"input_data_in_state\\\":false,\\\"secrets_ref\\\":{\\\"profile\\\":\\\"default\\\",\\\"account_id\\\":\\\"hudich-keyturn.testnet\\\"},\\\"response_format\\\":\\\"Json\\\",\\\"payment\\\":\\\"30000000000000000000000\\\",\\\"attached_usd\\\":\\\"0\\\",\\\"timestamp\\\":1794598558676405962,\\\"compile_only\\\":false,\\\"force_rebuild\\\":false,\\\"store_on_fastfs\\\":false,\\\"use_bound_identity\\\":false,\\\"project_uuid\\\":\\\"p0000000000000166\\\",\\\"project_id\\\":\\\"hudich-keyturn.testnet/keyturn-worker\\\"}\",\"data_id\":[187,145,73,85,208,149,143,238,215,30,116,133,174,91,191,49,88,174,161,54,254,239,86,80,36,136,177,11,113,246,218,6],\"timestamp\":1794598558676405962}]}"
+    ]
+   }
+  },
+  {
+   "outcome": {
+    "executor_id": "outlayer.testnet",
+    "logs": [
+     "[[yNEAR charged: \"1213500100000000000000\"]]",
+     "EVENT_JSON:{\"standard\":\"near-outlayer\",\"version\":\"1.0.0\",\"event\":\"execution_completed\",\"data\":[{\"sender_id\":\"watch.hudich-keyturn.testnet\",\"code_source\":{\"WasmUrl\":{\"url\":\"https://test.fastfs.io/hudich-keyturn.testnet/outlayer.testnet/f52458e9a998f1c5bb9802b61bca50c22cbc6bc60507e7e045631e32a444facd.wasm\",\"hash\":\"f52458e9a998f1c5bb9802b61bca50c22cbc6bc60507e7e045631e32a444facd\",\"build_target\":\"wasm32-wasip2\"}},\"resources_used\":{\"instructions\":1148794,\"time_ms\":2135,\"compile_time_ms\":null},\"success\":true,\"error_message\":null,\"payment_charged\":\"1213500100000000000000\",\"payment_refunded\":\"28786499900000000000000\",\"compilation_note\":\"Cached WASM from 2026-11-12T13:24:15.302456+00:00\",\"timestamp\":1794598565384652027}]}",
+     "Execution completed successfully. Output: Json(122 bytes), Resources: { instructions: 1148794, time_ms: 2135 }, Cost: 1213500100000000000000 yoctoNEAR, Refund: 28786499900000000000000 yoctoNEAR, Cached WASM from 2026-11-12T13:24:15.302456+00:00"
+    ]
+   }
+  },
+  {
+   "outcome": {
+    "executor_id": "contract.hudich-keyturn.testnet",
+    "logs": [
+     "EVENT_JSON:{\"standard\":\"keyturn\",\"version\":\"1.0.0\",\"event\":\"release_published\",\"data\":{\"project\":\"npm:@scammerop08/keyturn-demo\",\"version\":\"0.0.4\",\"hash\":\"af1f043c8b4f0e29a7c7907140ce822c7dc172dcce12c90e00f8ce2cc01ecf14\",\"via\":\"outlayer\"}}"
+    ]
+   }
+  }
+ ]
+}

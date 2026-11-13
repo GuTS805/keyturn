@@ -157,6 +157,7 @@ function show(summary) {
     ['Approved hash', `<code>${esc(summary.hash)}</code>`],
   ];
   if (summary.windowOpen) rows.splice(1, 0, ['Window', `${esc(formatDuration(summary.windowRemainingMs))} left to flag it`]);
+  if (summary.worker) rows.push(['Worker build', `<code>${esc(summary.worker.version_key)}</code><div class="approval-members"><span>${esc(summary.worker.project)} on ${esc(summary.worker.contract)}, pinned by the contract</span></div>`]);
   if (summary.flag) rows.push(['Flag', `${esc(summary.flag.by)}: ${esc(summary.flag.reason)}`]);
   $('releaseEvidence').hidden = false;
   $('releaseEvidence').innerHTML = `<div class="evidence-heading"><h2>Release record</h2><span class="small-label">Onchain approval evidence</span></div>
@@ -228,13 +229,13 @@ async function lookup({ quiet = false } = {}) {
     const proj = await rpcView({ rpc: RPC[net], contract, method: 'get_project', args: { project_id: project } });
     const rel = version ? await rpcView({ rpc: RPC[net], contract, method: 'get_release', args: { project_id: project, version } }) : null;
     const summary = proj && !version ? { found: true, message: 'Give a version to see its release.' } : summarize(proj, rel);
+    if (summary.status) {
+      try { summary.worker = await rpcView({ rpc: RPC[net], contract, method: 'get_outlayer' }); } catch { summary.worker = null; }
+    }
     out.innerHTML = show(summary);
     if (summary.hash && !quiet) { approvedHash = summary.hash; $('fileCard').hidden = false; $('fileResult').textContent = ''; }
     if (summary.status) {
-      let handoffReady = false;
-      if (summary.status === 'Executing') {
-        try { handoffReady = Boolean(await rpcView({ rpc: RPC[net], contract, method: 'get_outlayer' })); } catch { handoffReady = false; }
-      }
+      const handoffReady = Boolean(summary.worker);
       current = { summary, contract, project, version, handoffReady, net };
       renderActions();
     }
