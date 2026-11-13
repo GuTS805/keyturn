@@ -3,87 +3,96 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Keyturn</title>
-<style>
-  :root {
-    --bg: #fafaf7; --fg: #1c1c1a; --muted: #6b6b66; --line: #dcdcd4; --card: #ffffff;
-    --ok: #1e7a45; --bad: #b3261e; --warn: #8a5a00; --accent: #20324a;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #141412; --fg: #eeeee8; --muted: #9a9a92; --line: #33332f; --card: #1c1c19;
-      --ok: #5cc98a; --bad: #ff8a80; --warn: #e0b45a; --accent: #9db8da; }
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--fg);
-    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
-  h1 { font-size: 1.5rem; margin: 0 0 4px; }
-  p.lead { color: var(--muted); margin: 0 0 24px; }
-  form { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; margin-bottom: 24px; }
-  form .wide { grid-column: 1 / -1; }
-  label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: 4px; }
-  input[type=text] { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px;
-    background: var(--card); color: var(--fg); font: inherit; }
-  button { padding: 10px 16px; border: 0; border-radius: 6px; background: var(--accent); color: var(--bg);
-    font: inherit; cursor: pointer; }
-  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .status { font-size: 1.25rem; font-weight: 600; margin: 0 0 4px; }
-  .meaning { color: var(--muted); margin: 0 0 12px; }
-  dl { display: grid; grid-template-columns: 8.5rem 1fr; gap: 6px 12px; margin: 0; }
-  dt { color: var(--muted); }
-  dd { margin: 0; overflow-wrap: anywhere; }
-  code { font: .85rem ui-monospace, SFMono-Regular, Consolas, monospace; }
-  .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
-  .tick { display: inline-block; width: 1.1em; }
-  .error { color: var(--bad); }
-  h2 { font-size: 1rem; margin: 0 0 8px; }
-  .verdict { font-weight: 600; margin: 8px 0 4px; }
-  .finding { padding: 6px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
-  .finding small { color: var(--muted); display: block; }
-  .sev { display: inline-block; min-width: 4.2em; font-weight: 600; text-transform: uppercase; font-size: .75rem; }
-  .row { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; margin: 8px 0; }
-  @media (max-width: 520px) { .row { grid-template-columns: 1fr; } }
-  @media (max-width: 520px) { form { grid-template-columns: 1fr; } dl { grid-template-columns: 1fr; } }
-</style>
+<title>Keyturn — Release explorer</title>
+<meta name="description" content="Look up release approvals on NEAR, verify exact package bytes, and review changes with Watchtower.">
+<meta name="theme-color" content="#11120f">
+<link rel="stylesheet" href="./signal-board.css">
 </head>
 <body>
+<a class="skip-link" href="#releases">Skip to release lookup</a>
+<svg class="icon-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <symbol id="icon-key" viewBox="0 0 80 40"><circle cx="19" cy="20" r="13"/><path d="M32 20h42m-7 0v10m-12-10v7"/></symbol>
+  <symbol id="icon-package" viewBox="0 0 32 32"><path d="m16 3 12 7v13l-12 7-12-7V10zM4 10l12 7 12-7M16 17v13M10 6l12 7"/></symbol>
+  <symbol id="icon-upload" viewBox="0 0 48 48"><path d="M24 36V7M11 20 24 7l13 13M7 34v8h34v-8"/></symbol>
+  <symbol id="icon-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 10v7m0-12v2"/></symbol>
+  <symbol id="icon-arrow" viewBox="0 0 32 32"><path d="M4 16h24M18 6l10 10-10 10"/></symbol>
+</svg>
+<div class="shell">
+<div class="edition-line"><span>Independent approval. Exact bytes.</span><span class="edition-rule"></span><span>Built on NEAR</span></div>
+<header class="masthead">
+  <a class="brand" href="#releases" aria-label="Keyturn home"><svg class="key-icon" aria-hidden="true"><use href="#icon-key"/></svg><span>Keyturn</span></a>
+  <nav aria-label="Main navigation">
+    <a class="nav-link active" href="#releases" aria-current="location">Releases</a>
+    <a class="nav-link" href="#verify">Verify</a>
+    <a class="nav-link" href="#watchtower">Watchtower</a>
+  </nav>
+  <div class="header-badges"><span class="badge" id="networkBadge">Testnet</span><span class="badge badge-lime">Read only</span></div>
+</header>
 <main>
-  <h1>Keyturn</h1>
-  <p class="lead">Check a release against the contract. This page only reads the chain and holds no keys.</p>
-
-  <form id="form">
-    <div class="wide"><label for="contract">Contract</label>
-      <input id="contract" type="text" value="contract.hudich-keyturn.testnet" autocomplete="off"></div>
-    <div><label for="project">Project</label>
-      <input id="project" type="text" placeholder="npm:name or chrome:extension-id" autocomplete="off"></div>
-    <div><label for="version">Version</label>
-      <input id="version" type="text" placeholder="1.0.0" autocomplete="off"></div>
-    <div class="wide"><button type="submit">Look up</button></div>
-  </form>
-
-  <div id="out" aria-live="polite"></div>
-
-  <div class="card" id="fileCard" hidden>
-    <h2>Check a file against the approved hash</h2>
-    <p class="meaning">Choose the package you downloaded (the .tgz for npm, or the extension ZIP). It is hashed in your browser and never uploaded.</p>
-    <input id="file" type="file" aria-label="Package file">
-    <p id="fileResult" aria-live="polite"></p>
-    <div id="fileReview" aria-live="polite"></div>
-  </div>
-
-  <div class="card" id="reviewCard">
-    <h2>Watchtower: what does a release change?</h2>
-    <p class="meaning">Drop a package and it is compared with the version before it. It looks only at what is <em>new</em>: install scripts, credential reads, network calls, obfuscated blobs, new executables. Everything runs in your browser; nothing is uploaded.</p>
-    <div class="row">
-      <div><label for="rvNew">New release (.tgz)</label><input id="rvNew" type="file" accept=".tgz,.tar.gz"></div>
-      <div><label for="rvOld">Earlier version (.tgz, optional)</label><input id="rvOld" type="file" accept=".tgz,.tar.gz"></div>
+  <section class="release-overview" id="releases" aria-labelledby="pageTitle">
+    <div class="lookup-panel panel-light">
+      <h1 id="pageTitle">Check. Then trust.</h1>
+      <p class="lead">A release explorer for developer security on NEAR.</p>
+      <form id="form">
+        <h2 class="lookup-title">Look up release</h2>
+        <div class="lookup-fields">
+          <div class="project-field"><label for="project">Project</label><div class="project-input"><svg aria-hidden="true"><use href="#icon-package"/></svg><input id="project" type="text" placeholder="npm:name or chrome:extension-id" autocomplete="off" spellcheck="false"></div></div>
+          <div><label for="version">Version</label><input id="version" type="text" placeholder="1.0.0" autocomplete="off" spellcheck="false"></div>
+          <button type="submit">Look up release <span aria-hidden="true">↗</span></button>
+        </div>
+        <div class="lookup-meta"><label for="contract">Contract</label><input id="contract" type="text" value="contract.hudich-keyturn.testnet" autocomplete="off" spellcheck="false"><span class="meta-note">Onchain record</span></div>
+      </form>
+      <p class="lookup-note">Check a release against the contract. This page only reads the chain and holds no keys.</p>
     </div>
-    <p class="meaning" id="rvHint">With a package name below, the earlier version is fetched from the npm registry for you.</p>
-    <div><label for="rvName">npm package name (optional)</label><input id="rvName" type="text" placeholder="@scope/name" autocomplete="off"></div>
-    <div id="rvOut" aria-live="polite" style="margin-top:12px"></div>
+    <aside class="status-panel" aria-label="Release status">
+      <div class="panel-kicker"><span>Release status</span><span class="live-label"><i></i> Onchain</span></div>
+      <div id="out" aria-live="polite"><div class="card empty-status"><p class="status">Not loaded</p><div class="release-metrics"><div><span>Version</span><strong>—</strong></div><div><span>Approvals</span><strong>—/—</strong></div></div><p class="meaning">Look up a project and version to see its release status and approval quorum.</p></div></div>
+    </aside>
+  </section>
+
+  <section class="process-strip" aria-label="Release workflow">
+    <div class="process-step"><span class="step-number">01</span><div><h2>Build</h2><p id="stepBuild">Exact artifact hash</p></div><svg aria-hidden="true"><use href="#icon-arrow"/></svg></div>
+    <div class="process-step"><span class="step-number">02</span><div><h2>Approve</h2><p id="stepApprove">Maintainer quorum</p></div><svg aria-hidden="true"><use href="#icon-arrow"/></svg></div>
+    <div class="process-step"><span class="step-number">03</span><div><h2>Wait</h2><p id="stepWait">Public review window</p></div><svg aria-hidden="true"><use href="#icon-arrow"/></svg></div>
+    <div class="process-step"><span class="step-number">04</span><div><h2>Publish</h2><p id="stepPublish">Verified bytes only</p></div></div>
+  </section>
+
+  <section class="release-evidence panel-light" id="releaseEvidence" aria-label="Release evidence" hidden></section>
+
+  <div class="tools-grid">
+    <section class="verify-panel panel-light" id="verify" aria-labelledby="verifyTitle">
+      <div class="section-heading"><h2 id="verifyTitle">Verify a file</h2><span class="section-index">01 / Artifact</span></div>
+      <p class="meaning">Check a local artifact against the approved release hash.</p>
+      <div class="verify-hint"><svg aria-hidden="true"><use href="#icon-upload"/></svg><h3>Look up a release first</h3><p>Once an approved hash is available, choose your package here to check its exact bytes.</p><span class="small-label">.tgz / extension ZIP</span></div>
+      <div id="fileCard" hidden>
+        <p class="meaning">Choose the package you downloaded (the .tgz for npm, or the extension ZIP). It is hashed in your browser and never uploaded.</p>
+        <div class="file-check-layout">
+          <label class="file-drop" for="file"><svg aria-hidden="true"><use href="#icon-upload"/></svg><strong>Choose a package</strong><span>Click to select a local file</span><span class="small-label">.tgz / extension ZIP</span><input id="file" type="file" aria-label="Package file"></label>
+          <div class="file-check-details"><h3>SHA-256</h3><p class="meaning">Your file is checked against the hash approved by the maintainers.</p><dl class="file-meta" id="fileMeta" hidden><dt>File</dt><dd id="fileName"></dd><dt>Size</dt><dd id="fileSize"></dd></dl><p id="fileResult" aria-live="polite">Select a file to compare its hash.</p></div>
+        </div>
+        <div id="fileReview" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section class="watchtower-panel" id="watchtower" aria-labelledby="watchtowerTitle">
+      <div id="reviewCard">
+        <div class="section-heading"><h2 id="watchtowerTitle">Watchtower</h2><span class="section-index">02 / Review</span></div>
+        <p class="meaning">Compare the new package behaviour with the previous release.</p>
+        <details class="review-explainer"><summary>What does a release change?</summary><p>Drop a package and it is compared with the version before it. It looks only at what is <em>new</em>: install scripts, credential reads, network calls, obfuscated blobs, new executables. Everything runs in your browser; nothing is uploaded.</p></details>
+        <div class="row">
+          <div><label for="rvNew">New release (.tgz)</label><input id="rvNew" type="file" accept=".tgz,.tar.gz"></div>
+          <div><label for="rvOld">Earlier version (.tgz, optional)</label><input id="rvOld" type="file" accept=".tgz,.tar.gz"></div>
+        </div>
+        <p class="meaning" id="rvHint">With a package name below, the earlier version is fetched from the npm registry for you.</p>
+        <div><label for="rvName">npm package name (optional)</label><input id="rvName" type="text" placeholder="@scope/name" autocomplete="off" spellcheck="false"></div>
+        <div id="rvOut" aria-live="polite"></div>
+      </div>
+    </section>
   </div>
 </main>
+<footer class="page-footer"><p><svg aria-hidden="true"><use href="#icon-info"/></svg>Files are hashed locally in your browser.</p><span class="badge badge-lime">Exact bytes. Shared approval.</span></footer>
+</div>
+<noscript><p class="noscript-message">Enable JavaScript to look up onchain releases and verify package files.</p></noscript>
 
 <script type="module">
 import { RPC, rpcView, summarize, sha256Hex, formatDuration } from './keyturn.js';
@@ -137,15 +146,60 @@ function show(summary) {
     .map((m) => `<div><span class="tick ${summary.approvals.includes(m) ? 'ok' : ''}">${summary.approvals.includes(m) ? '✓' : '·'}</span>${esc(m)}</div>`)
     .join('');
   const rows = [
-    ['Approvals', `${summary.approvals.length} of ${summary.needed} needed<br>${approvals}`],
+    ['Approvals', `${summary.approvals.length} of ${summary.needed} needed<div class="approval-members">${approvals}</div>`],
     ['Proposed by', esc(summary.proposer)],
     ['Approved hash', `<code>${esc(summary.hash)}</code>`],
   ];
   if (summary.windowOpen) rows.splice(1, 0, ['Window', `${esc(formatDuration(summary.windowRemainingMs))} left to flag it`]);
   if (summary.flag) rows.push(['Flag', `${esc(summary.flag.by)}: ${esc(summary.flag.reason)}`]);
-  return `<div class="card"><p class="status ${cls}">${esc(summary.status)}</p><p class="meaning">${esc(summary.meaning)}</p>
-    <dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join('')}</dl></div>`;
+  $('releaseEvidence').hidden = false;
+  $('releaseEvidence').innerHTML = `<div class="evidence-heading"><h2>Release record</h2><span class="small-label">Onchain approval evidence</span></div>
+    <dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join('')}</dl>`;
+  const quorum = summary.approvals.length >= summary.needed;
+  const windowPassed = ['Executing', 'Released', 'Recalled'].includes(summary.status);
+  const stages = [
+    ['stepBuild', summary.hash ? 'Hash recorded' : 'Exact artifact hash', Boolean(summary.hash)],
+    ['stepApprove', `${summary.approvals.length} of ${summary.needed} approvals`, quorum],
+    ['stepWait', summary.windowOpen ? `${formatDuration(summary.windowRemainingMs)} left to flag`
+      : windowPassed ? 'Window passed' : summary.status === 'Flagged' ? 'Review blocked'
+      : summary.status === 'Pending' ? 'Window elapsed' : 'Public review window', windowPassed],
+    ['stepPublish', summary.meaning, summary.status === 'Released'],
+  ];
+  for (const [id, text, complete] of stages) {
+    $(id).textContent = text;
+    $(id).closest('.process-step').dataset.complete = String(complete);
+  }
+  return `<div class="card"><p class="status ${cls}">${esc(summary.status)}</p>
+    <div class="release-metrics"><div><span>Version</span><strong class="version-value">${esc(looked.version || '—')}</strong></div><div><span>Approvals</span><strong>${summary.approvals.length}/${summary.needed}</strong></div></div>
+    <p class="release-context">${esc(looked.project)}</p><p class="meaning">${esc(summary.meaning)}</p>
+    <p class="status-caption">Approvals apply to the exact artifact hash. They do not guarantee the code is safe.</p></div>`;
 }
+
+function resetReleasePresentation() {
+  $('releaseEvidence').hidden = true;
+  $('releaseEvidence').innerHTML = '';
+  $('fileMeta').hidden = true;
+  $('file').value = '';
+  const defaults = { stepBuild: 'Exact artifact hash', stepApprove: 'Maintainer quorum', stepWait: 'Public review window', stepPublish: 'Verified bytes only' };
+  for (const [id, text] of Object.entries(defaults)) {
+    $(id).textContent = text;
+    delete $(id).closest('.process-step').dataset.complete;
+  }
+}
+
+function updateNetworkBadge() {
+  $('networkBadge').textContent = $('contract').value.trim().endsWith('.near') ? 'Mainnet' : 'Testnet';
+}
+$('contract').addEventListener('input', updateNetworkBadge);
+document.querySelectorAll('.nav-link').forEach((link) => {
+  link.addEventListener('click', () => {
+    document.querySelectorAll('.nav-link').forEach((item) => {
+      item.classList.toggle('active', item === link);
+      if (item === link) item.setAttribute('aria-current', 'location');
+      else item.removeAttribute('aria-current');
+    });
+  });
+});
 
 $('form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -153,6 +207,7 @@ $('form').addEventListener('submit', async (e) => {
   const project = $('project').value.trim();
   const version = $('version').value.trim();
   const out = $('out');
+  resetReleasePresentation();
   $('fileCard').hidden = true;
   approvedHash = null;
   looked = { project, version };
@@ -174,6 +229,7 @@ $('form').addEventListener('submit', async (e) => {
 // A link like ?project=npm:name&version=1.0.0 runs the lookup straight away.
 const params = new URLSearchParams(location.search);
 if (params.get('contract')) $('contract').value = params.get('contract');
+updateNetworkBadge();
 if (params.get('project')) {
   $('project').value = params.get('project');
   $('version').value = params.get('version') || '';
@@ -183,6 +239,9 @@ if (params.get('project')) {
 $('file').addEventListener('change', async (e) => {
   const f = e.target.files[0];
   if (!f || !approvedHash) return;
+  $('fileMeta').hidden = false;
+  $('fileName').textContent = f.name;
+  $('fileSize').textContent = `${f.size.toLocaleString()} bytes`;
   const hash = await sha256Hex(await f.arrayBuffer());
   const r = $('fileResult');
   const match = hash === approvedHash;
@@ -191,7 +250,7 @@ $('file').addEventListener('change', async (e) => {
     ? 'Match. This file is exactly what the quorum approved.'
     : `Different. This file hashes to ${hash}, but the quorum approved ${approvedHash}.`;
   const name = looked.project.startsWith('npm:') ? looked.project.slice(4) : '';
-  if (!name || !/.(tgz|gz)$/i.test(f.name)) { $('fileReview').innerHTML = ''; return; }
+  if (!name || !/\.(tgz|gz)$/i.test(f.name)) { $('fileReview').innerHTML = ''; return; }
   $('fileReview').innerHTML = '<p class="meaning">Running Watchtower on it…</p>';
   try {
     $('fileReview').innerHTML = await review(f, name, looked.version, null);
