@@ -25,8 +25,12 @@ use std::collections::HashSet;
 /// Raw storage key for the OutLayer settings. Kept outside the contract struct so that
 /// adding it needs no state migration. The one-letter prefixes of the maps never collide with it.
 const OUTLAYER_KEY: &[u8] = b"outlayer";
-/// What a hand-off must at least carry. OutLayer estimated about 0.007 NEAR for one run.
-const MIN_HANDOFF_YOCTO: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR
+/// What a hand-off must at least carry. OutLayer estimates about 0.013 NEAR for the limits below.
+const MIN_HANDOFF_YOCTO: u128 = 20_000_000_000_000_000_000_000; // 0.02 NEAR
+/// The worker does TLS and hashing in wasm. 2 billion instructions was too few: OutLayer killed
+/// the run before the worker could answer.
+const MAX_INSTRUCTIONS: u64 = 20_000_000_000;
+const MAX_SECONDS: u64 = 120;
 const OUTLAYER_GAS: Gas = Gas::from_tgas(100);
 const CALLBACK_GAS: Gas = Gas::from_tgas(40);
 const MAX_RESULT_LEN: usize = 4096;
@@ -514,14 +518,14 @@ impl Keyturn {
     /// Hand a release that is `Executing` to the OutLayer worker. The contract builds the
     /// worker's request itself from the approved hash it stores, so the caller can only choose
     /// where the tarball is downloaded from; the worker refuses any file whose SHA-256 differs.
-    /// Anyone may call it. Attach at least 0.01 NEAR; OutLayer refunds what it does not use to
+    /// Anyone may call it. Attach at least 0.02 NEAR; OutLayer refunds what it does not use to
     /// the caller. When the worker reports the published hash, `on_publish_result` marks the
     /// release `Released` if that hash equals the approved one.
     #[payable]
     pub fn request_publish(&mut self, project_id: String, version: String, artifact_url: String) -> Promise {
         let config = Self::outlayer_config().unwrap_or_else(|| env::panic_str("the OutLayer settings are not set"));
         let deposit = env::attached_deposit();
-        require!(deposit.as_yoctonear() >= MIN_HANDOFF_YOCTO, "attach at least 0.01 NEAR for the OutLayer run");
+        require!(deposit.as_yoctonear() >= MIN_HANDOFF_YOCTO, "attach at least 0.02 NEAR for the OutLayer run");
         require!(
             artifact_url.starts_with("https://") && artifact_url.len() <= 2048,
             "artifact_url must be an https URL"
@@ -546,7 +550,7 @@ impl Keyturn {
         .to_string();
         let args = near_sdk::serde_json::json!({
             "source": { "Project": { "project_id": config.project, "version_key": null } },
-            "resource_limits": { "max_instructions": 2_000_000_000u64, "max_memory_mb": 128, "max_execution_seconds": 60 },
+            "resource_limits": { "max_instructions": MAX_INSTRUCTIONS, "max_memory_mb": 128, "max_execution_seconds": MAX_SECONDS },
             "input_data": input,
             "secrets_ref": { "profile": config.secrets_profile, "account_id": config.secrets_account },
             "response_format": "Json",
@@ -1351,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "attach at least 0.01 NEAR")]
+    #[should_panic(expected = "attach at least 0.02 NEAR")]
     fn handoff_needs_a_deposit() {
         let mut c = configured();
         executing(&mut c);
