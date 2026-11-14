@@ -28,6 +28,8 @@ const artifactUrl = args.find((a) => /^https:\/\//.test(a));
 if (!version || !artifactUrl) throw new Error('usage: demo-handoff.mjs <version> <https artifact url> [--yes] [--tamper] [--resume]');
 const really = args.includes('--yes');
 const tamper = args.includes('--tamper');
+const appearsLater = args.includes('--appears-later'); // the file is uploaded while the hand-off is running (use with --tamper)
+const unreachable = args.includes('--unreachable'); // the URL serves nothing: every attempt fails with a retryable worker error
 const resume = args.includes('--resume');
 const WINDOW_SECONDS = 20;
 const DEPOSIT = 80_000_000_000_000_000_000_000n; // 0.08 NEAR = four attempts at 0.02; what is not spent comes back
@@ -54,9 +56,9 @@ const hash = tamper ? sha256(Buffer.from(`not the tarball ${version}`)) : realHa
 const settings = await chain.ada.view('get_outlayer');
 if (!settings) throw new Error('the contract has no OutLayer settings; run setup-outlayer.mjs first');
 const got = await fetch(artifactUrl);
-if (!got.ok) throw new Error(`artifact URL answered HTTP ${got.status}`);
-const served = sha256(Buffer.from(await got.arrayBuffer()));
-if (!tamper && served !== realHash) throw new Error(`the artifact at that URL is not the expected tarball (${served} instead of ${realHash})`);
+if (!got.ok && !unreachable && !appearsLater) throw new Error(`artifact URL answered HTTP ${got.status}`);
+const served = got.ok ? sha256(Buffer.from(await got.arrayBuffer())) : `nothing (HTTP ${got.status})`;
+if (!tamper && !unreachable && !appearsLater && served !== realHash) throw new Error(`the artifact at that URL is not the expected tarball (${served} instead of ${realHash})`);
 say(`artifact      public, serves ${served}`);
 say(`approved hash ${hash}${tamper ? '  (deliberately NOT the artifact)' : ''}`);
 const existing = await fetch(`${REGISTRY}/${name.replace('/', '%2f')}`);
@@ -97,6 +99,8 @@ if (!resume) {
 }
 
 say('\n4. Anyone calls request_publish once. The CONTRACT calls OutLayer, and calls it again by itself if the answer is lost.');
+const bal = async () => BigInt((await chain.watch.provider.viewAccount({ accountId: A.watch })).amount);
+const before = await bal();
 const res = await chain.watch.callRaw('request_publish', { project_id: project, version, artifact_url: artifactUrl }, { deposit: DEPOSIT, gas: GAS });
 const tx = res.transaction?.hash || res.transaction_outcome?.id;
 say(`   tx ${tx}`);
@@ -121,7 +125,23 @@ const lost = failedAttempts.filter((e) => e.data.will_retry).length;
 say(`   lost or pending answers the contract retried by itself: ${lost}`);
 check(!(await chain.ada.view('get_handoff', { project_id: project, version })), 'the contract holds no money for this release any more');
 
-if (tamper) {
+if (unreachable) {
+  // Every attempt fails with a retryable error, so the contract must use all its attempts and give up.
+  const retries = failedAttempts.filter((e) => e.data.will_retry).length;
+  check(retries === 3, `the contract asked again by itself 3 times (4 attempts in all), saw ${retries}`);
+  check(events.some((e) => e.event === 'publish_gave_up'), 'then it gave up and said so (publish_gave_up)');
+  check(failedAttempts.every((e) => e.data.error === 'artifact_fetch_failed'), `every attempt failed with the worker's retryable error: ${[...new Set(failedAttempts.map((e) => e.data.error))].join(', ')}`);
+  check((await statusOf()) === 'Executing', 'the release stays Executing, and can be handed over again');
+  const lost = before - (await bal());
+  check(lost < 30_000_000_000_000_000_000_000n, `of the 0.08 NEAR attached, all but ${(Number(lost) / 1e24).toFixed(4)} NEAR (gas and OutLayer's base charge) came back`);
+} else if (appearsLater) {
+  // The file was not there for the first attempts and appeared during the chain.
+  const early = failedAttempts.filter((e) => e.data.will_retry && e.data.error === 'artifact_fetch_failed').length;
+  check(early >= 1, `the first ${early} attempt(s) failed because the file was not there yet, and the contract asked again by itself`);
+  check(last?.event === 'publish_failed' && last.data.error === 'hash_mismatch' && !last.data.will_retry, `a later attempt reached the file and the worker gave its final answer: ${last?.data?.error}`);
+  check(!events.some((e) => e.event === 'publish_gave_up'), 'the contract did not give up');
+  check((await statusOf()) === 'Executing', 'the release stays Executing, nothing was published (the approved hash was wrong on purpose)');
+} else if (tamper) {
   // The worker itself must have answered, with its own refusal. An OutLayer-side error
   // (for example an access rule) is not the thing this step is meant to show.
   check(last?.event === 'publish_failed' && last.data.error === 'hash_mismatch' && !last.data.will_retry, `the worker refused, and that was final: ${last?.data?.error}`);

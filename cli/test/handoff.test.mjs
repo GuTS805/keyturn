@@ -45,6 +45,14 @@ test('asks again after lost answers until the release is Released', async () => 
   assert.equal(chain.calls[0].opts.deposit, 80_000_000_000_000_000_000_000n);
 });
 
+test('after a pending answer it waits before asking again', async () => {
+  const waits = [];
+  const chain = fakeChain({ answers: ['pending', 'released'] });
+  const r = await handoff(chain, { ...quick, pendingWaitMs: 60000, sleep: async (ms) => { waits.push(ms); } });
+  assert.equal(r.ok, true);
+  assert.ok(waits.includes(60000), 'it waited a minute after pending');
+});
+
 test('a final answer from the worker stops it, and says why', async () => {
   const chain = fakeChain({ answers: ['unreadable_answer', 'hash_mismatch'] });
   const r = await handoff(chain, quick);

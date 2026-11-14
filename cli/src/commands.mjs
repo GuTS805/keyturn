@@ -266,7 +266,7 @@ const RETRYABLE = ['pending', 'upload_failed', 'artifact_fetch_failed', 'publish
  * (it is limited by gas); this goes on from there. Asking again is safe: the worker confirms an
  * existing version and never publishes twice.
  */
-export async function handoff(chain, { project, version, artifactUrl, maxMinutes = 30, pollMs = 10000, deposit = '0.08', say = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now }) {
+export async function handoff(chain, { project, version, artifactUrl, maxMinutes = 30, pollMs = 10000, deposit = '0.08', pendingWaitMs = 60000, say = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now }) {
   const deadline = now() + maxMinutes * 60000;
   let rounds = 0;
   while (now() < deadline) {
@@ -292,6 +292,8 @@ export async function handoff(chain, { project, version, artifactUrl, maxMinutes
     const events = await chain.events(tx, chain.accountId).catch(() => []);
     const last = [...events].reverse().find((e) => e.event === 'publish_failed');
     say(`round ${rounds} ended: ${last ? last.data.error : 'no answer'}`);
+    // The registry needs a few minutes to show an upload; asking again at once only finds it still pending.
+    if (last?.data.error === 'pending') await sleep(pendingWaitMs);
     if (last && !RETRYABLE.includes(last.data.error)) return { ok: false, reason: `final answer from the worker: ${last.data.error}${last.data.detail ? ' (' + last.data.detail + ')' : ''}`, rounds };
   }
   return { ok: false, reason: `not released after ${maxMinutes} minutes`, rounds };
