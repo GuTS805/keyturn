@@ -6,6 +6,8 @@ Keyturn puts a two-person rule in front of software releases. A NEAR contract ho
 
 Status: work in progress, built for NEAR HACKATHON (tracks: open, security, agents).
 
+**AI assistance and what this repository builds on.** This repository was written with Claude Code (Anthropic): the AI wrote most of the code, tests and documentation, and the maintainer directed the work and supplied the accounts and credentials. The first commit is dated 2026-11-11. Third-party pieces: `near-sdk` 5.30.1 (contract), `near-api-js` (CLI), `@hot-labs/near-connect` 0.11.4 (wallet connection in the dashboard, loaded from a CDN only when you press Connect wallet), OutLayer and its `outlayer-verify` tool (TEE execution and quote verification), and GSAP and HyperFrames only for the demo video, which is not part of this repository.
+
 ## The problem
 
 In 2026 a single stolen credential was enough to publish a malicious release:
