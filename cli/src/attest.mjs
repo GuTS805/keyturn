@@ -58,10 +58,10 @@ export async function fetchRecord({ api, signer, txHash, fetchImpl = fetch }) {
 }
 
 /** Run `outlayer-verify job <id> --network testnet --short`. Exit 0 proven, 1 failed, 2 unproven, 3 usage. */
-export function runOutlayerVerify(jobId, { bin = 'outlayer-verify', network = 'testnet' } = {}) {
+export function runOutlayerVerify(jobId, { bin = process.env.KEYTURN_OUTLAYER_VERIFY || 'outlayer-verify', network = 'testnet' } = {}) {
   return new Promise((resolve) => {
-    const args = ['job', String(jobId), '--short'];
-    if (network === 'testnet') args.push('--network', 'testnet');
+    // The default API address of the version I installed is OutLayer's retired one (HTTP 410), so pass it.
+    const args = ['job', String(jobId), '--network', network, '--api', OUTLAYER_API[network], '--short', '--no-color'];
     const child = spawn(bin, args);
     let out = '';
     child.stdout.on('data', (d) => (out += d));
