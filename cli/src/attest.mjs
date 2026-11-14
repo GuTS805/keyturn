@@ -11,6 +11,10 @@
 // plainly when it could not.
 
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+
+export const OUTLAYER_API = { testnet: 'https://testnet-api.outlayer.ai', mainnet: 'https://api.outlayer.ai' };
+const sha256 = (s) => createHash('sha256').update(s).digest('hex');
 
 const EVENT = 'EVENT_JSON:';
 
@@ -44,10 +48,19 @@ async function rpcTx({ rpc, txHash, signer, fetchImpl }) {
   return body.result;
 }
 
-/** Run `outlayer-verify tx <hash> --short`. Exit 0 proven, 1 failed, 2 unproven, 3 usage. */
-export function runOutlayerVerify(txHash, { bin = 'outlayer-verify', network = 'testnet' } = {}) {
+/** OutLayer's public record of the run that this transaction started, and its attestation. */
+export async function fetchRecord({ api, signer, txHash, fetchImpl = fetch }) {
+  const jobs = await (await fetchImpl(`${api}/public/jobs?user_account_id=${encodeURIComponent(signer)}&limit=100`)).json();
+  const job = Array.isArray(jobs) ? jobs.find((j) => j.transaction_hash === txHash) : null;
+  if (!job) return { job: null, attestation: null };
+  const res = await fetchImpl(`${api}/attestations/${job.job_id}`);
+  return { job, attestation: res.ok ? await res.json() : null };
+}
+
+/** Run `outlayer-verify job <id> --network testnet --short`. Exit 0 proven, 1 failed, 2 unproven, 3 usage. */
+export function runOutlayerVerify(jobId, { bin = 'outlayer-verify', network = 'testnet' } = {}) {
   return new Promise((resolve) => {
-    const args = ['tx', txHash, '--short'];
+    const args = ['job', String(jobId), '--short'];
     if (network === 'testnet') args.push('--network', 'testnet');
     const child = spawn(bin, args);
     let out = '';
@@ -65,7 +78,7 @@ export function runOutlayerVerify(txHash, { bin = 'outlayer-verify', network = '
  * @param chain   a NearChain for the Keyturn contract (views only)
  * @returns {{ checks: {ok: boolean|null, text: string}[], ok: boolean }}  ok = no check failed
  */
-export async function attest(chain, { txHash, signer, fetchImpl = fetch, verifier = runOutlayerVerify, tx: given }) {
+export async function attest(chain, { txHash, signer, fetchImpl = fetch, verifier = runOutlayerVerify, tx: given, record: givenRecord, api }) {
   const checks = [];
   const add = (ok, text) => checks.push({ ok, text });
   const tx = given || (await rpcTx({ rpc: chain.rpcUrl, txHash, signer, fetchImpl }));
@@ -99,9 +112,25 @@ export async function attest(chain, { txHash, signer, fetchImpl = fetch, verifie
   add(Boolean(done) && done.data.hash === release.artifact_hash, 'the contract recorded Released from OutLayer\'s answer, with the approved hash');
   add(release.status === 'Released' || release.status === 'Recalled', `the release is ${release.status} on the contract`);
 
-  const tee = await verifier(tx.transaction.hash || txHash);
+  // OutLayer's own record of the run. It is only data from their server until the quote is
+  // verified, but its fields must agree with what the chain shows.
+  const network = chain.network || 'testnet';
+  const { job, attestation: att } = givenRecord || (await fetchRecord({ api: api || OUTLAYER_API[network], signer: signer || tx.transaction.signer_id, txHash: tx.transaction.hash || txHash, fetchImpl }));
+  add(Boolean(job?.success) && job?.status === 'completed', job ? `OutLayer's public record: job ${job.job_id}, ${job.status}` : 'OutLayer has no public record of a run for this transaction');
+  if (job && att) {
+    add(att.wasm_hash === config.version_key && att.executed_wasm_sha256 === config.version_key, 'its attestation names the pinned build, and the executed binary is the same');
+    add(att.project_id === config.project && att.caller_account_id === (signer || tx.transaction.signer_id), `its attestation names the pinned project and the caller ${att.caller_account_id}`);
+    add(request && att.input_hash === sha256(request.input_data), 'its input hash equals the SHA-256 of the request that is in the transaction');
+    add(Boolean(att.tdx_quote) && att.transaction_hash === (tx.transaction.hash || txHash), 'it carries a TDX quote and names this transaction');
+  } else if (job) {
+    add(false, 'OutLayer has no attestation for that job');
+  }
+
+  // The Intel signature chain, the approved-build list and the binding of the quote to this
+  // input, output and code. Not re-implemented here: OutLayer's own verifier does it.
+  const tee = job ? await verifier(job.job_id) : { status: 'unproven', text: 'no job' };
   if (tee.status === 'proven') add(true, `TEE quote (outlayer-verify): PROVEN. ${tee.text}`);
-  else if (tee.status === 'missing') add(null, 'TEE quote: NOT CHECKED (outlayer-verify is not installed: cargo install --git https://github.com/out-layer/outlayer-verify outlayer-verify)');
+  else if (tee.status === 'missing') add(null, `TEE quote: NOT CHECKED HERE (outlayer-verify is not installed). Check it in a browser at https://app.outlayer.ai/attestation/${job?.job_id} (the dashboard must be on testnet) or run: outlayer-verify job ${job?.job_id} --network ${network}`);
   else add(tee.status === 'unproven' ? null : false, `TEE quote (outlayer-verify): ${tee.status.toUpperCase()}. ${tee.text}`);
-  return { checks, ok: checks.every((c) => c.ok !== false), teeChecked: tee.status === 'proven' };
+  return { checks, ok: checks.every((c) => c.ok !== false), teeChecked: tee.status === 'proven', jobId: job?.job_id };
 }
