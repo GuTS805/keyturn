@@ -30,8 +30,8 @@ const really = args.includes('--yes');
 const tamper = args.includes('--tamper');
 const resume = args.includes('--resume');
 const WINDOW_SECONDS = 20;
-const DEPOSIT = 30_000_000_000_000_000_000_000n; // 0.03 NEAR; OutLayer refunds what it does not use
-const GAS = 250_000_000_000_000n;
+const DEPOSIT = 80_000_000_000_000_000_000_000n; // 0.08 NEAR = four attempts at 0.02; what is not spent comes back
+const GAS = 300_000_000_000_000n; // every retry reserves the gas of the next one
 
 const name = need('KEYTURN_DEMO_PACKAGE');
 const REGISTRY = (process.env.KEYTURN_NPM_REGISTRY || 'https://registry.npmjs.org').replace(/\/$/, '');
@@ -96,34 +96,35 @@ if (!resume) {
   check((await statusOf()) === 'Executing', 'release is Executing');
 }
 
-say('\n4. Anyone calls request_publish. The CONTRACT calls OutLayer; the answer comes back to the contract.');
-let last;
-for (let attempt = 1; attempt <= 30; attempt++) {
-  const res = await chain.watch.callRaw('request_publish', { project_id: project, version, artifact_url: artifactUrl }, { deposit: DEPOSIT, gas: GAS });
-  const tx = res.transaction?.hash || res.transaction_outcome?.id;
-  say(`   attempt ${attempt}: tx ${tx}`);
-  let events = [];
-  for (let i = 0; i < 60; i++) {
-    await sleep(5);
-    try {
-      events = (await chain.watch.events(tx, A.watch)).filter((e) => e.event === 'release_published' || e.event === 'publish_failed');
-    } catch {
-      events = [];
-    }
-    if (events.length) break;
+say('\n4. Anyone calls request_publish once. The CONTRACT calls OutLayer, and calls it again by itself if the answer is lost.');
+const res = await chain.watch.callRaw('request_publish', { project_id: project, version, artifact_url: artifactUrl }, { deposit: DEPOSIT, gas: GAS });
+const tx = res.transaction?.hash || res.transaction_outcome?.id;
+say(`   tx ${tx}`);
+// The chain ends when the contract has cleared its hand-off record: released, a final answer, or out of attempts.
+let seen = 0;
+let events = [];
+const started = Date.now();
+for (let i = 0; i < 180; i++) {
+  await sleep(10);
+  events = (await chain.watch.events(tx, A.watch).catch(() => [])).filter((e) => ['publish_requested', 'publish_failed', 'publish_gave_up', 'release_published'].includes(e.event));
+  for (const e of events.slice(seen)) {
+    const d = e.data;
+    say(`   +${Math.round((Date.now() - started) / 1000)}s ${e.event}${d.error ? ' ' + d.error : ''}${d.will_retry !== undefined ? (d.will_retry ? ' (the contract asks again, ' + d.attempts_left + ' left)' : ' (final)') : ''}${d.attempts ? ' (up to ' + d.attempts + ' attempts)' : ''}`);
   }
-  last = events[0];
-  say(`   -> ${last ? JSON.stringify(last.data) : 'no answer yet'}`);
-  if (!last || last.event === 'release_published') break;
-  if (last.data.error !== 'pending') break;
-  say('   the registry is still processing; asking again in 15s (the worker never publishes twice)');
-  await sleep(15);
+  seen = events.length;
+  const handoff = await chain.ada.view('get_handoff', { project_id: project, version });
+  if (!handoff && events.some((e) => e.event !== 'publish_requested')) break;
 }
+const failedAttempts = events.filter((e) => e.event === 'publish_failed');
+const last = [...events].reverse().find((e) => e.event === 'release_published' || e.event === 'publish_failed');
+const lost = failedAttempts.filter((e) => e.data.will_retry).length;
+say(`   lost or pending answers the contract retried by itself: ${lost}`);
+check(!(await chain.ada.view('get_handoff', { project_id: project, version })), 'the contract holds no money for this release any more');
 
 if (tamper) {
   // The worker itself must have answered, with its own refusal. An OutLayer-side error
   // (for example an access rule) is not the thing this step is meant to show.
-  check(last?.event === 'publish_failed' && last.data.error === 'hash_mismatch', `the worker refused: ${last?.data?.error}`);
+  check(last?.event === 'publish_failed' && last.data.error === 'hash_mismatch' && !last.data.will_retry, `the worker refused, and that was final: ${last?.data?.error}`);
   check((await statusOf()) === 'Executing', 'the release stays Executing, nothing was published');
   const now = await fetch(`${REGISTRY}/${name.replace('/', '%2f')}`);
   const versions = now.ok ? Object.keys((await now.json()).versions || {}) : [];

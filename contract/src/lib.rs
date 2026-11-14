@@ -19,7 +19,7 @@
 
 use near_sdk::json_types::U128;
 use near_sdk::store::LookupMap;
-use near_sdk::{env, near, require, AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseError};
+use near_sdk::{env, near, require, AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseError, PromiseOrValue};
 use std::collections::HashSet;
 
 /// Raw storage key for the OutLayer settings. Kept outside the contract struct so that
@@ -27,14 +27,21 @@ use std::collections::HashSet;
 const OUTLAYER_KEY: &[u8] = b"outlayer2";
 /// The first layout of the settings, before the build was pinned. Removed when the new ones are set.
 const OUTLAYER_KEY_V1: &[u8] = b"outlayer";
-/// What a hand-off must at least carry. OutLayer estimates about 0.013 NEAR for the limits below.
-const MIN_HANDOFF_YOCTO: u128 = 20_000_000_000_000_000_000_000; // 0.02 NEAR
-/// The worker does TLS and hashing in wasm. 2 billion instructions was too few: OutLayer killed
-/// the run before the worker could answer.
+/// What one attempt costs: OutLayer estimates about 0.013 NEAR for the limits below and refunds
+/// the rest to the payer.
+const ATTEMPT_COST_YOCTO: u128 = 20_000_000_000_000_000_000_000; // 0.02 NEAR
+/// With 300 Tgas attached each attempt reserves about 70 Tgas for the next, so four fit.
+const MAX_ATTEMPTS: u8 = 4;
+/// NEAR's yield times out after 200 blocks; with a margin.
+const YIELD_BLOCKS: u64 = 215;
+/// The worker does TLS and hashing in wasm. These limits are generous; a run is charged for what it uses.
 const MAX_INSTRUCTIONS: u64 = 20_000_000_000;
 const MAX_SECONDS: u64 = 120;
-const OUTLAYER_GAS: Gas = Gas::from_tgas(100);
-const CALLBACK_GAS: Gas = Gas::from_tgas(40);
+/// OutLayer needs at least about 55 Tgas for request_execution (measured: 52 fails, 55 works).
+const OUTLAYER_GAS: Gas = Gas::from_tgas(60);
+const CALLBACK_MIN_GAS: Gas = Gas::from_tgas(20);
+/// A retry is only started when this much is left, so a chain never stalls halfway.
+const RETRY_NEEDS: Gas = Gas::from_tgas(60 + 20 + 15);
 const MAX_RESULT_LEN: usize = 4096;
 
 const MIN_FLAG_BOND_YOCTO: u128 = 100_000_000_000_000_000_000_000; // 0.1 NEAR
@@ -239,6 +246,91 @@ fn parse_worker_output(bytes: &[u8]) -> Option<WorkerOutput> {
             worker_output_from(&near_sdk::serde_json::from_str::<near_sdk::serde_json::Value>(s).ok()?)
         }
         other => worker_output_from(other),
+    }
+}
+
+/// Raw storage prefix of the hand-off state, one entry per release. Outside the contract struct so
+/// that adding it needs no state migration.
+const HANDOFF_PREFIX: &[u8] = b"handoff:";
+
+/// A hand-off to OutLayer that is running: whose money is held, and how many attempts remain.
+#[near(serializers=[borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Handoff {
+    pub payer: AccountId,
+    /// Money held for further attempts, in yoctoNEAR. Returned to `payer` when the chain ends.
+    pub escrow: U128,
+    pub attempts_left: u8,
+    /// The running attempt can still answer until this block; after it NEAR's yield has timed out.
+    pub until_height: u64,
+    pub artifact_url: String,
+}
+
+fn handoff_storage_key(release: &str) -> Vec<u8> {
+    [HANDOFF_PREFIX, release.as_bytes()].concat()
+}
+
+fn load_handoff(release: &str) -> Option<Handoff> {
+    env::storage_read(&handoff_storage_key(release)).and_then(|b| near_sdk::borsh::from_slice(&b).ok())
+}
+
+fn save_handoff(release: &str, h: &Handoff) {
+    env::storage_write(&handoff_storage_key(release), &near_sdk::borsh::to_vec(h).unwrap());
+}
+
+fn clear_handoff(release: &str) {
+    env::storage_remove(&handoff_storage_key(release));
+}
+
+fn refund(to: &AccountId, yocto: u128) {
+    if yocto > 0 {
+        let _ = Promise::new(to.clone()).transfer(NearToken::from_yoctonear(yocto));
+    }
+}
+
+/// What the callback does with OutLayer's answer.
+enum Answer {
+    /// The worker published, and says this is the hash.
+    Published(String),
+    /// Ask again: the answer was lost or the worker is still waiting on the registry.
+    /// `deposit_back`: the OutLayer call itself failed, so NEAR returned its deposit to this
+    /// contract and it is the payer's again (a lost answer is different: OutLayer refunds the payer).
+    Retry { error: String, detail: Option<String>, deposit_back: bool },
+    /// Final: asking again cannot change it.
+    Stop(String, Option<String>),
+}
+
+/// Worker errors that can pass on their own. Anything else the worker reports is final.
+const RETRYABLE: [&str; 6] = [
+    "pending",
+    "upload_failed",
+    "artifact_fetch_failed",
+    "publish_failed",
+    "post_check_failed",
+    "stage_fetch_failed",
+];
+
+fn classify(result: Result<Vec<u8>, PromiseError>) -> Answer {
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(_) => return Answer::Retry { error: "outlayer_call_failed".to_string(), detail: None, deposit_back: true },
+    };
+    match parse_worker_output(&bytes) {
+        None => Answer::Retry {
+            error: "unreadable_answer".to_string(),
+            detail: Some(String::from_utf8_lossy(&bytes).chars().take(120).collect()),
+            deposit_back: false,
+        },
+        Some(WorkerOutput { ok: true, published_hash: Some(hash), .. }) => Answer::Published(hash),
+        Some(WorkerOutput { ok: true, .. }) => Answer::Stop("no_hash".to_string(), None),
+        Some(WorkerOutput { error, detail, .. }) => {
+            let error = error.unwrap_or_else(|| "unknown".to_string());
+            if RETRYABLE.contains(&error.as_str()) {
+                Answer::Retry { error, detail, deposit_back: false }
+            } else {
+                Answer::Stop(error, detail)
+            }
+        }
     }
 }
 
@@ -523,17 +615,26 @@ impl Keyturn {
         Self::outlayer_config()
     }
 
-    /// Hand a release that is `Executing` to the OutLayer worker. The contract builds the
-    /// worker's request itself from the approved hash it stores, so the caller can only choose
-    /// where the tarball is downloaded from; the worker refuses any file whose SHA-256 differs.
-    /// Anyone may call it. Attach at least 0.02 NEAR; OutLayer refunds what it does not use to
-    /// the caller. When the worker reports the published hash, `on_publish_result` marks the
-    /// release `Released` if that hash equals the approved one.
+    /// Hand a release that is `Executing` to the OutLayer worker, and keep handing it over until
+    /// the worker has answered. The contract builds the worker's request itself from the approved
+    /// hash it stores, so the caller can only choose where the tarball is downloaded from; the
+    /// worker refuses any file whose SHA-256 differs. Anyone may call it.
+    ///
+    /// OutLayer sometimes loses an answer: if its executor picks the request up more than about
+    /// 200 blocks late, NEAR's yield has already timed out and the callback gets nothing. So the
+    /// contract retries by itself. The caller attaches up to 0.08 NEAR (0.02 per attempt, at most
+    /// four attempts); each attempt sends 0.02 NEAR to OutLayer, which refunds what it does not
+    /// use straight to the caller, and whatever was not spent goes back to the caller at the end.
+    /// A retry happens only when the answer was lost or the worker says it is still waiting (the
+    /// registry processes an upload for a few minutes) or hit a transient error; a worker that says
+    /// the file does not have the approved hash is final. When the worker reports the published
+    /// hash and it equals the approved one, `on_publish_result` marks the release `Released`.
+    /// Attach 300 Tgas: every retry reserves the gas of the next one from what is left.
     #[payable]
     pub fn request_publish(&mut self, project_id: String, version: String, artifact_url: String) -> Promise {
         let config = Self::outlayer_config().unwrap_or_else(|| env::panic_str("the OutLayer settings are not set"));
-        let deposit = env::attached_deposit();
-        require!(deposit.as_yoctonear() >= MIN_HANDOFF_YOCTO, "attach at least 0.02 NEAR for the OutLayer run");
+        let deposit = env::attached_deposit().as_yoctonear();
+        require!(deposit >= ATTEMPT_COST_YOCTO, "attach at least 0.02 NEAR for the OutLayer run");
         require!(
             artifact_url.starts_with("https://") && artifact_url.len() <= 2048,
             "artifact_url must be an https URL"
@@ -543,93 +644,100 @@ impl Keyturn {
         let release = self.release_mut(&key);
         require!(release.status == Status::Executing, "release is not executing");
         let approved_hash = release.artifact_hash.clone();
-        let mode = match project.registry {
-            Registry::Npm => "publish",
-            Registry::Chrome => "chrome",
-        };
-        let package = project_id.split_once(':').map(|(_, rest)| rest).unwrap_or(&project_id);
-        let input = near_sdk::serde_json::json!({
-            "mode": mode,
-            "package": package,
-            "version": version,
-            "approved_hash": approved_hash,
-            "artifact_url": artifact_url,
-        })
-        .to_string();
-        let args = near_sdk::serde_json::json!({
-            "source": { "Project": { "project_id": config.project, "version_key": config.version_key } },
-            "resource_limits": { "max_instructions": MAX_INSTRUCTIONS, "max_memory_mb": 128, "max_execution_seconds": MAX_SECONDS },
-            "input_data": input,
-            "secrets_ref": { "profile": config.secrets_profile, "account_id": config.secrets_account },
-            "response_format": "Json",
-            "payer_account_id": env::predecessor_account_id(),
-        });
+        if let Some(old) = load_handoff(&key) {
+            require!(
+                env::block_height() > old.until_height,
+                "an attempt is still running; its answer arrives within about four minutes"
+            );
+            // An earlier chain that never reported back: return what it still held.
+            refund(&old.payer, old.escrow.0);
+        }
+        let caller = env::predecessor_account_id();
+        let attempts = (deposit / ATTEMPT_COST_YOCTO).min(MAX_ATTEMPTS as u128) as u8;
+        let usable = attempts as u128 * ATTEMPT_COST_YOCTO;
+        refund(&caller, deposit - usable);
         emit(
             "publish_requested",
-            near_sdk::serde_json::json!({ "project": project_id, "version": version, "by": env::predecessor_account_id() }),
+            near_sdk::serde_json::json!({ "project": project_id, "version": version, "by": caller, "attempts": attempts }),
         );
-        Promise::new(config.contract)
-            .function_call("request_execution".to_string(), args.to_string().into_bytes(), deposit, OUTLAYER_GAS)
-            .then(
-                Self::ext(env::current_account_id())
-                    .with_static_gas(CALLBACK_GAS)
-                    .on_publish_result(project_id, version),
-            )
+        let state = Handoff { payer: caller, escrow: U128(usable), attempts_left: attempts, until_height: 0, artifact_url };
+        Self::dispatch(&project_id, &version, project.registry, &approved_hash, state, &config)
+    }
+
+    /// Where a hand-off stands: whose money is held, how many attempts are left, and until which
+    /// block the running attempt can still answer.
+    pub fn get_handoff(&self, project_id: String, version: String) -> Option<Handoff> {
+        load_handoff(&release_key(&project_id, &version))
     }
 
     /// Receives the worker's answer from OutLayer. Only this contract can call it.
     #[private]
-    pub fn on_publish_result(&mut self, project_id: String, version: String) -> bool {
+    pub fn on_publish_result(&mut self, project_id: String, version: String) -> PromiseOrValue<bool> {
         let key = release_key(&project_id, &version);
-        let bytes = match env::promise_result_checked(0, MAX_RESULT_LEN) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                let why = match e {
-                    PromiseError::Failed => "the OutLayer call failed",
-                    PromiseError::TooLong(_) => "the OutLayer answer was too long",
-                    _ => "the OutLayer call did not return a result",
-                };
-                emit("publish_failed", near_sdk::serde_json::json!({ "project": project_id, "version": version, "error": why }));
-                return false;
-            }
-        };
-        let out = parse_worker_output(&bytes);
+        let state = load_handoff(&key);
+        let mut state = state;
+        let answer = classify(env::promise_result_checked(0, MAX_RESULT_LEN));
+        let project = self.project(&project_id);
         let release = self.release_mut(&key);
+        let finish = |state: Option<Handoff>| {
+            if let Some(s) = state {
+                refund(&s.payer, s.escrow.0);
+            }
+            clear_handoff(&key);
+        };
         if release.status != Status::Executing {
-            return false;
+            finish(state);
+            return PromiseOrValue::Value(false);
         }
-        match out {
-            Some(WorkerOutput { ok: true, published_hash: Some(hash), .. }) if hash == release.artifact_hash => {
+        let failed = |error: &str, detail: &Option<String>, retry: bool, left: u8| {
+            emit(
+                "publish_failed",
+                near_sdk::serde_json::json!({ "project": project_id, "version": version, "error": error, "detail": detail, "will_retry": retry, "attempts_left": left }),
+            );
+        };
+        match answer {
+            Answer::Published(hash) if hash == release.artifact_hash => {
                 release.status = Status::Released;
                 release.released_at_ms = Some(env::block_timestamp_ms());
                 emit(
                     "release_published",
                     near_sdk::serde_json::json!({ "project": project_id, "version": version, "hash": hash, "via": "outlayer" }),
                 );
-                true
+                finish(state);
+                PromiseOrValue::Value(true)
             }
-            Some(WorkerOutput { ok: true, published_hash, .. }) => {
-                emit(
-                    "publish_failed",
-                    near_sdk::serde_json::json!({ "project": project_id, "version": version, "error": "hash_mismatch", "got": published_hash }),
-                );
-                false
+            Answer::Published(hash) => {
+                failed("hash_mismatch", &Some(format!("the worker published {hash}")), false, 0);
+                finish(state);
+                PromiseOrValue::Value(false)
             }
-            Some(WorkerOutput { error, detail, .. }) => {
-                // "pending" is not a failure: the registry is still processing. Ask again.
-                emit(
-                    "publish_failed",
-                    near_sdk::serde_json::json!({ "project": project_id, "version": version, "error": error, "detail": detail }),
-                );
-                false
+            Answer::Retry { error, detail, deposit_back } => {
+                if deposit_back {
+                    if let Some(s) = state.as_mut() {
+                        s.escrow = U128(s.escrow.0 + ATTEMPT_COST_YOCTO);
+                    }
+                }
+                let gas_left = env::prepaid_gas().as_gas().saturating_sub(env::used_gas().as_gas());
+                let can_retry = state.as_ref().map_or(false, |s| s.attempts_left > 0 && s.escrow.0 >= ATTEMPT_COST_YOCTO)
+                    && gas_left >= RETRY_NEEDS.as_gas();
+                match (can_retry, state, Self::outlayer_config()) {
+                    (true, Some(s), Some(config)) => {
+                        failed(&error, &detail, true, s.attempts_left);
+                        let approved_hash = release.artifact_hash.clone();
+                        PromiseOrValue::Promise(Self::dispatch(&project_id, &version, project.registry, &approved_hash, s, &config))
+                    }
+                    (_, s, _) => {
+                        failed(&error, &detail, false, 0);
+                        emit("publish_gave_up", near_sdk::serde_json::json!({ "project": project_id, "version": version }));
+                        finish(s);
+                        PromiseOrValue::Value(false)
+                    }
+                }
             }
-            None => {
-                let raw: String = String::from_utf8_lossy(&bytes).chars().take(300).collect();
-                emit(
-                    "publish_failed",
-                    near_sdk::serde_json::json!({ "project": project_id, "version": version, "error": "unreadable_answer", "raw": raw }),
-                );
-                false
+            Answer::Stop(error, detail) => {
+                failed(&error, &detail, false, 0);
+                finish(state);
+                PromiseOrValue::Value(false)
             }
         }
     }
@@ -794,6 +902,50 @@ impl Keyturn {
 }
 
 impl Keyturn {
+    /// One attempt: send 0.02 NEAR and the worker's request to OutLayer, and ask to be called back.
+    /// The callback gets all the gas that is left (weight 1), so a chain of retries can reserve
+    /// the gas of its next link.
+    fn dispatch(project_id: &str, version: &str, registry: Registry, approved_hash: &str, mut st: Handoff, config: &OutlayerConfig) -> Promise {
+        st.escrow = U128(st.escrow.0 - ATTEMPT_COST_YOCTO);
+        st.attempts_left -= 1;
+        st.until_height = env::block_height() + YIELD_BLOCKS;
+        let mode = match registry {
+            Registry::Npm => "publish",
+            Registry::Chrome => "chrome",
+        };
+        let package = project_id.split_once(':').map(|(_, rest)| rest).unwrap_or(project_id);
+        let input = near_sdk::serde_json::json!({
+            "mode": mode,
+            "package": package,
+            "version": version,
+            "approved_hash": approved_hash,
+            "artifact_url": st.artifact_url,
+        })
+        .to_string();
+        let args = near_sdk::serde_json::json!({
+            "source": { "Project": { "project_id": config.project, "version_key": config.version_key } },
+            "resource_limits": { "max_instructions": MAX_INSTRUCTIONS, "max_memory_mb": 128, "max_execution_seconds": MAX_SECONDS },
+            "input_data": input,
+            "secrets_ref": { "profile": config.secrets_profile, "account_id": config.secrets_account },
+            "response_format": "Json",
+            "payer_account_id": st.payer,
+        });
+        save_handoff(&release_key(project_id, version), &st);
+        Promise::new(config.contract.clone())
+            .function_call(
+                "request_execution".to_string(),
+                args.to_string().into_bytes(),
+                NearToken::from_yoctonear(ATTEMPT_COST_YOCTO),
+                OUTLAYER_GAS,
+            )
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(CALLBACK_MIN_GAS)
+                    .with_unused_gas_weight(1)
+                    .on_publish_result(project_id.to_string(), version.to_string()),
+            )
+    }
+
     fn outlayer_config() -> Option<OutlayerConfig> {
         env::storage_read(OUTLAYER_KEY).and_then(|b| near_sdk::borsh::from_slice(&b).ok())
     }
@@ -1329,6 +1481,32 @@ mod tests {
         )
     }
 
+    /// The callback's answer as a plain bool (a retry counts as "not released yet").
+    fn answered(c: &mut Keyturn) -> bool {
+        match c.on_publish_result("npm:leftpad".into(), "1.0.0".into()) {
+            PromiseOrValue::Value(v) => v,
+            PromiseOrValue::Promise(_) => false,
+        }
+    }
+
+    fn receipts_text() -> String {
+        format!("{:?}", near_sdk::test_utils::get_created_receipts())
+    }
+
+    fn bytes_of(needle: &str) -> String {
+        needle.bytes().map(|b| b.to_string()).collect::<Vec<_>>().join(", ")
+    }
+
+    const COST: u128 = 20_000_000_000_000_000_000_000; // 0.02 NEAR
+
+    /// Sets the hand-off state as request_publish would have left it.
+    fn running(attempts_left: u8, escrow: u128) {
+        save_handoff(
+            "npm:leftpad@1.0.0",
+            &Handoff { payer: acct("payer.test"), escrow: U128(escrow), attempts_left, until_height: 1, artifact_url: OL_URL.to_string() },
+        );
+    }
+
     #[test]
     fn outlayer_settings_are_set_once_and_only_by_the_contract() {
         let mut c = configured();
@@ -1423,7 +1601,7 @@ mod tests {
     fn callback_releases_when_the_worker_reports_the_approved_hash() {
         let mut c = configured();
         executing(&mut c);
-        let released = callback_with(ok_answer(HASH), || c.on_publish_result("npm:leftpad".into(), "1.0.0".into()));
+        let released = callback_with(ok_answer(HASH), || answered(&mut c));
         assert!(released);
         assert_eq!(rel(&c, "1.0.0").status, Status::Released);
         assert!(c.is_released("npm:leftpad".into(), "1.0.0".into(), HASH.into()));
@@ -1436,7 +1614,7 @@ mod tests {
         let inner = format!(r#"{{"ok":true,"published_hash":"{}"}}"#, HASH);
         let wrapped = near_sdk::serde_json::to_vec(&inner).unwrap();
         let released = callback_with(near_sdk::PromiseResult::Successful(wrapped), || {
-            c.on_publish_result("npm:leftpad".into(), "1.0.0".into())
+            answered(&mut c)
         });
         assert!(released);
     }
@@ -1445,7 +1623,7 @@ mod tests {
     fn callback_does_not_release_on_a_different_hash() {
         let mut c = configured();
         executing(&mut c);
-        let released = callback_with(ok_answer(OTHER_HASH), || c.on_publish_result("npm:leftpad".into(), "1.0.0".into()));
+        let released = callback_with(ok_answer(OTHER_HASH), || answered(&mut c));
         assert!(!released);
         assert_eq!(rel(&c, "1.0.0").status, Status::Executing);
     }
@@ -1461,7 +1639,7 @@ mod tests {
             r#"{"ok":true}"#,
         ] {
             let released = callback_with(near_sdk::PromiseResult::Successful(body.as_bytes().to_vec()), || {
-                c.on_publish_result("npm:leftpad".into(), "1.0.0".into())
+                answered(&mut c)
             });
             assert!(!released, "{body}");
             assert_eq!(rel(&c, "1.0.0").status, Status::Executing, "{body}");
@@ -1473,7 +1651,7 @@ mod tests {
         let mut c = configured();
         executing(&mut c);
         let released = callback_with(near_sdk::PromiseResult::Failed, || {
-            c.on_publish_result("npm:leftpad".into(), "1.0.0".into())
+            answered(&mut c)
         });
         assert!(!released);
         assert_eq!(rel(&c, "1.0.0").status, Status::Executing);
@@ -1483,8 +1661,201 @@ mod tests {
     fn a_second_answer_cannot_release_twice_or_resurrect_a_recalled_release() {
         let mut c = configured();
         executing(&mut c);
-        assert!(callback_with(ok_answer(HASH), || c.on_publish_result("npm:leftpad".into(), "1.0.0".into())));
-        let again = callback_with(ok_answer(HASH), || c.on_publish_result("npm:leftpad".into(), "1.0.0".into()));
+        assert!(callback_with(ok_answer(HASH), || answered(&mut c)));
+        let again = callback_with(ok_answer(HASH), || answered(&mut c));
         assert!(!again);
+    }
+
+    // ---- Retrying a lost answer ------------------------------------------------
+
+    #[test]
+    fn a_hand_off_holds_the_deposit_for_up_to_four_attempts_and_returns_the_rest() {
+        let mut c = configured();
+        executing(&mut c);
+        // 0.08 NEAR pays for four attempts; one is sent now, three are held.
+        at("payer.test", 9_000_000_000, 4 * COST);
+        let _ = c.request_publish("npm:leftpad".into(), "1.0.0".into(), OL_URL.into());
+        let h = c.get_handoff("npm:leftpad".into(), "1.0.0".into()).unwrap();
+        assert_eq!(h.attempts_left, 3);
+        assert_eq!(h.escrow.0, 3 * COST);
+        assert_eq!(h.payer, acct("payer.test"));
+        // More than four attempts' worth: the surplus goes straight back.
+        clear_handoff("npm:leftpad@1.0.0");
+        at("payer.test", 9_000_000_000, 8 * COST);
+        let _ = c.request_publish("npm:leftpad".into(), "1.0.0".into(), OL_URL.into());
+        let h2 = c.get_handoff("npm:leftpad".into(), "1.0.0".into()).unwrap();
+        assert_eq!(h2.attempts_left, 3, "never more than four attempts");
+        let text = receipts_text();
+        assert!(text.contains("Transfer") && text.contains("payer.test"), "the surplus is sent back: {text}");
+    }
+
+    #[test]
+    fn one_attempt_at_a_time() {
+        let mut c = configured();
+        executing(&mut c);
+        at("payer.test", 9_000_000_000, 2 * COST);
+        let _ = c.request_publish("npm:leftpad".into(), "1.0.0".into(), OL_URL.into());
+        // The first attempt can still answer for about 215 blocks.
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            at("other.test", 9_000_000_100, 2 * COST);
+            let _ = c.request_publish("npm:leftpad".into(), "1.0.0".into(), OL_URL.into());
+        }));
+        assert!(again.is_err(), "a second chain must wait while an attempt runs");
+    }
+
+    #[test]
+    fn a_lost_answer_is_asked_again_by_the_contract_itself() {
+        let mut c = configured();
+        executing(&mut c);
+        // OutLayer lost the answer (the yield timed out): OutLayer refunds the payer itself, so the
+        // escrow of the next attempt is just what was held minus 0.02.
+        running(3, 3 * COST);
+        let released = callback_with(near_sdk::PromiseResult::Successful(b"null".to_vec()), || answered(&mut c));
+        assert!(!released);
+        assert_eq!(rel(&c, "1.0.0").status, Status::Executing);
+        let h = c.get_handoff("npm:leftpad".into(), "1.0.0".into()).unwrap();
+        assert_eq!(h.attempts_left, 2, "one attempt used");
+        assert_eq!(h.escrow.0, 2 * COST, "0.02 NEAR went to OutLayer");
+        let text = receipts_text();
+        assert!(text.contains(&bytes_of("request_execution")), "the contract called OutLayer again");
+        assert!(text.contains(&bytes_of("on_publish_result")), "and asked to be called back");
+    }
+
+    #[test]
+    fn a_failed_call_gives_its_deposit_back_to_the_escrow_before_asking_again() {
+        let mut c = configured();
+        executing(&mut c);
+        // The call to OutLayer failed (for example not enough gas): NEAR returned the 0.02 NEAR to
+        // this contract, so it is held for the payer again, then 0.02 goes out for the next attempt.
+        running(3, 2 * COST);
+        let released = callback_with(near_sdk::PromiseResult::Failed, || answered(&mut c));
+        assert!(!released);
+        let h = c.get_handoff("npm:leftpad".into(), "1.0.0".into()).unwrap();
+        assert_eq!(h.attempts_left, 2);
+        assert_eq!(h.escrow.0, 2 * COST, "2 held + 1 returned - 1 sent again");
+    }
+
+    #[test]
+    fn a_failed_call_on_the_last_attempt_returns_everything_to_the_payer() {
+        let mut c = configured();
+        executing(&mut c);
+        running(0, 0);
+        let released = callback_with(near_sdk::PromiseResult::Failed, || answered(&mut c));
+        assert!(!released);
+        assert!(c.get_handoff("npm:leftpad".into(), "1.0.0".into()).is_none());
+        // The 0.02 NEAR that came back is sent on to the payer, not kept.
+        assert!(receipts_text().contains("payer.test"));
+    }
+
+    #[test]
+    fn a_retry_is_only_started_when_enough_gas_is_left() {
+        let mut c = configured();
+        executing(&mut c);
+        running(3, 3 * COST);
+        // 90 Tgas left is less than a new attempt needs (60 for OutLayer, 20 for the callback, a margin):
+        // the contract gives up cleanly and returns the money instead of stalling halfway.
+        testing_env!(
+            VMContextBuilder::new()
+                .current_account_id(acct("keyturn.test"))
+                .predecessor_account_id(acct("keyturn.test"))
+                .prepaid_gas(near_sdk::Gas::from_tgas(90))
+                .build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![near_sdk::PromiseResult::Successful(b"null".to_vec())]
+        );
+        let released = answered(&mut c);
+        assert!(!released);
+        assert!(c.get_handoff("npm:leftpad".into(), "1.0.0".into()).is_none());
+        let text = receipts_text();
+        assert!(text.contains("payer.test"), "the held money goes back");
+        assert!(!text.contains(&bytes_of("request_execution")));
+    }
+
+    #[test]
+    fn pending_and_transient_worker_errors_are_asked_again() {
+        let mut c = configured();
+        executing(&mut c);
+        for error in ["pending", "upload_failed", "artifact_fetch_failed", "publish_failed", "post_check_failed", "stage_fetch_failed"] {
+            running(2, 2 * COST);
+            let body = format!(r#"{{"ok":false,"error":"{error}","detail":"x"}}"#);
+            callback_with(near_sdk::PromiseResult::Successful(body.into_bytes()), || answered(&mut c));
+            let h = c.get_handoff("npm:leftpad".into(), "1.0.0".into()).expect(error);
+            assert_eq!(h.attempts_left, 1, "{error} is retried");
+        }
+    }
+
+    #[test]
+    fn a_worker_that_says_the_file_is_wrong_is_final_and_the_money_comes_back() {
+        let mut c = configured();
+        executing(&mut c);
+        for error in ["hash_mismatch", "bad_input", "bad_secret", "manifest_mismatch", "auth_failed"] {
+            running(3, 3 * COST);
+            let body = format!(r#"{{"ok":false,"error":"{error}","detail":"x"}}"#);
+            let released = callback_with(near_sdk::PromiseResult::Successful(body.into_bytes()), || answered(&mut c));
+            assert!(!released);
+            assert_eq!(rel(&c, "1.0.0").status, Status::Executing, "{error}");
+            assert!(c.get_handoff("npm:leftpad".into(), "1.0.0".into()).is_none(), "{error}: no further attempt");
+            let text = receipts_text();
+            assert!(text.contains("Transfer") && text.contains("payer.test"), "{error}: escrow returned");
+            assert!(!text.contains(&bytes_of("request_execution")), "{error}: OutLayer is not called again");
+        }
+    }
+
+    #[test]
+    fn when_the_attempts_run_out_the_contract_gives_up_and_returns_what_is_left() {
+        let mut c = configured();
+        executing(&mut c);
+        running(0, COST / 2);
+        let released = callback_with(near_sdk::PromiseResult::Failed, || answered(&mut c));
+        assert!(!released);
+        assert_eq!(rel(&c, "1.0.0").status, Status::Executing, "it can be asked again later");
+        assert!(c.get_handoff("npm:leftpad".into(), "1.0.0".into()).is_none());
+        let text = receipts_text();
+        assert!(text.contains("Transfer") && text.contains("payer.test"));
+        assert!(!text.contains(&bytes_of("request_execution")));
+    }
+
+    #[test]
+    fn success_releases_clears_the_hand_off_and_returns_the_unused_deposit() {
+        let mut c = configured();
+        executing(&mut c);
+        running(2, 2 * COST);
+        let released = callback_with(ok_answer(HASH), || answered(&mut c));
+        assert!(released);
+        assert_eq!(rel(&c, "1.0.0").status, Status::Released);
+        assert!(c.get_handoff("npm:leftpad".into(), "1.0.0".into()).is_none());
+        assert!(receipts_text().contains("payer.test"), "the unused escrow goes back");
+    }
+
+    #[test]
+    fn a_hash_the_worker_published_that_was_not_approved_is_never_released() {
+        let mut c = configured();
+        executing(&mut c);
+        running(2, 2 * COST);
+        let released = callback_with(ok_answer(OTHER_HASH), || answered(&mut c));
+        assert!(!released);
+        assert_eq!(rel(&c, "1.0.0").status, Status::Executing);
+        assert!(c.get_handoff("npm:leftpad".into(), "1.0.0".into()).is_none(), "not retried: it is not a lost answer");
+    }
+
+    #[test]
+    fn an_old_chain_that_never_answered_can_be_replaced_and_its_money_returned() {
+        let mut c = configured();
+        executing(&mut c);
+        // until_height 1 is long past at the block of the next call.
+        running(3, 3 * COST);
+        testing_env!(VMContextBuilder::new()
+            .current_account_id(acct("keyturn.test"))
+            .predecessor_account_id(acct("other.test"))
+            .attached_deposit(NearToken::from_yoctonear(COST))
+            .block_height(500)
+            .build());
+        let _ = c.request_publish("npm:leftpad".into(), "1.0.0".into(), OL_URL.into());
+        let h = c.get_handoff("npm:leftpad".into(), "1.0.0".into()).unwrap();
+        assert_eq!(h.payer, acct("other.test"));
+        assert_eq!(h.attempts_left, 0);
+        assert!(receipts_text().contains("payer.test"), "the earlier payer got its escrow back");
     }
 }

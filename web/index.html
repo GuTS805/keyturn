@@ -316,12 +316,18 @@ async function runAction(id) {
     const said = eventsFromOutcome(outcome).find((e) => e.event === 'publish_failed');
     busy.delete(id);
     await lookup({ quiet: true });
-    let note = said
-      ? `OutLayer answered: <b>${esc(said.data.error || 'failed')}</b>${said.data.detail ? ` (${esc(said.data.detail)})` : ''}. The release stays Executing; ${said.data.error === 'pending' ? 'ask again in a minute, the worker never publishes twice' : 'check the URL and try again'}.`
-      : 'Done. The record above is refreshed from the chain.';
-    if (id === 'handoff' && !said) note = 'Sent. OutLayer is running the worker; this page refreshes when the contract records the result.';
+    let note = 'Done. The record above is refreshed from the chain.';
+    if (id === 'handoff') {
+      if (said && !said.data.will_retry) {
+        note = `OutLayer answered: <b>${esc(said.data.error || 'failed')}</b>${said.data.detail ? ` (${esc(said.data.detail)})` : ''}. That is final; the release stays Executing and your unspent deposit is returned.`;
+      } else if (said) {
+        note = `OutLayer lost an answer (<b>${esc(said.data.error || 'failed')}</b>). The contract is asking again by itself, ${esc(said.data.attempts_left)} attempt(s) left. This page keeps looking.`;
+      } else {
+        note = 'Sent. OutLayer is running the worker; this page refreshes when the contract records the result.';
+      }
+    }
     renderActions({ message: note + link });
-    if (id === 'handoff' && !said) watchUntilReleased(link);
+    if (id === 'handoff' && !(said && !said.data.will_retry)) watchUntilReleased(link);
   } catch (err) {
     busy.delete(id);
     renderActions({ message: `<span class="bad">${esc(err?.message || String(err))}</span>` });
@@ -330,15 +336,22 @@ async function runAction(id) {
 
 // After a hand-off OutLayer answers on its own a few seconds later. Look again until the contract moves on.
 async function watchUntilReleased(link) {
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < 120; i++) {
     await new Promise((r) => setTimeout(r, 6000));
     if (!current || current.summary.status !== 'Executing') return;
+    const { contract, project, version, net } = current;
+    let handoff = null;
+    try { handoff = await rpcView({ rpc: RPC[net], contract, method: 'get_handoff', args: { project_id: project, version } }); } catch { /* keep looking */ }
     await lookup({ quiet: true });
     if (current && current.summary.status !== 'Executing') {
       renderActions({ message: `The contract recorded the result: <b>${esc(current.summary.status)}</b>.${link}` });
       return;
     }
-    renderActions({ message: `Waiting for OutLayer… ${link}` });
+    if (!handoff) {
+      renderActions({ message: `The contract stopped asking: the worker gave a final answer or the attempts ran out. The release is still Executing, and you can hand it over again.${link}` });
+      return;
+    }
+    renderActions({ message: `Waiting for OutLayer… ${esc(handoff.attempts_left)} more attempt(s) held by the contract. ${link}` });
   }
 }
 

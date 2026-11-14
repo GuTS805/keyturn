@@ -91,8 +91,8 @@ test('buildRequest produces the wallet format with exact deposits and gas', () =
   const h = buildRequest({ contract: 'k.test', project: 'npm:x', version: '1.0.0', action: hand, value: 'https://a.test/x.tgz' });
   assert.equal(h.actions[0].params.methodName, 'request_publish');
   assert.deepEqual(h.actions[0].params.args, { project_id: 'npm:x', version: '1.0.0', artifact_url: 'https://a.test/x.tgz' });
-  assert.equal(h.actions[0].params.deposit, '30000000000000000000000'); // 0.03 NEAR
-  assert.equal(h.actions[0].params.gas, '250000000000000');
+  assert.equal(h.actions[0].params.deposit, '80000000000000000000000'); // 0.08 NEAR: four attempts
+  assert.equal(h.actions[0].params.gas, '300000000000000');
   const ap = by(availableActions({ summary: sum({}), account: 'ada.test' }), 'approve');
   const a = buildRequest({ contract: 'k.test', project: 'npm:x', version: '1.0.0', action: ap });
   assert.equal(a.actions[0].params.deposit, '0');

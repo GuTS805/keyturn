@@ -10,7 +10,7 @@ const tgas = (n) => String(BigInt(n) * 10n ** 12n);
 const near = (n) => String((BigInt(Math.round(n * 1000)) * NEAR) / 1000n);
 
 export const FLAG_BOND_NEAR = 0.1;
-export const HANDOFF_DEPOSIT_NEAR = 0.03;
+export const HANDOFF_DEPOSIT_NEAR = 0.08;
 
 const isMember = (summary, account) => Boolean(account) && summary.members.includes(account);
 
@@ -66,7 +66,7 @@ export function availableActions({ summary, account, nowMs = Date.now(), handoff
         note: !handoffReady
           ? 'This contract has no OutLayer settings, so publishing goes through the CLI relay.'
           : account
-            ? `The contract calls OutLayer, which runs the worker. ${HANDOFF_DEPOSIT_NEAR} NEAR is attached; OutLayer refunds what it does not use.`
+            ? `The contract calls OutLayer, which runs the worker, and calls it again by itself if the answer is lost (up to four attempts). ${HANDOFF_DEPOSIT_NEAR} NEAR is attached; what is not spent comes back to you.`
             : 'Connect a wallet.',
       });
       break;
@@ -121,7 +121,7 @@ export function buildRequest({ contract, project, version, action, value }) {
         params: {
           methodName: action.method,
           args,
-          gas: tgas(action.id === 'handoff' ? 250 : 60),
+          gas: tgas(action.id === 'handoff' ? 300 : 60),
           deposit: action.depositNear ? near(action.depositNear) : '0',
         },
       },

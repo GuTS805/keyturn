@@ -38,6 +38,9 @@ Commands:
   watch     <project>@<version> --tarball file.tgz [--previous old.tgz | --registry URL] [--flag] [--bond 0.1] [--ai]
             analyse the approved bytes against the previous version; with --flag, flag a risky release in its public window
             --ai adds a second opinion from NEAR AI Cloud (NEAR_AI_API_KEY and KEYTURN_AI_MODEL)
+  handoff   <project>@<version> --artifact-url URL [--max-minutes 30]
+            hand an Executing release to OutLayer through the contract and keep asking until it is Released or the
+            worker gives a final answer (0.08 NEAR is attached per round; what is not spent comes back)
   attest    <tx hash> [--signer ACCOUNT] [--require-tee]
             check a release that was published through OutLayer: the contract itself called it, the pinned build ran,
             the approved hash was in the request, the contract recorded the answer; plus the Intel TDX quote through
@@ -68,6 +71,7 @@ const options = {
   worker: { type: 'string' },
   json: { type: 'boolean' },
   signer: { type: 'string' },
+  'max-minutes': { type: 'string' },
   'require-tee': { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
 };
@@ -192,6 +196,14 @@ async function main() {
         : process.env.KEYTURN_NPM_REGISTRY || 'https://registry.npmjs.org');
       const r = await cmd.verify(chain, { project, version, registryUrl });
       console.log(`${r.ok ? 'OK  ' : 'FAIL'} ${project}@${version}: ${r.reason}`);
+      process.exit(r.ok ? 0 : 1);
+      break;
+    }
+    case 'handoff': {
+      needVersion();
+      if (!v['artifact-url']) fail('handoff needs --artifact-url');
+      const r = await cmd.handoff(chain, { project, version, artifactUrl: v['artifact-url'], maxMinutes: Number(v['max-minutes'] || 30), say: console.log });
+      console.log(r.ok ? `RELEASED after ${r.rounds} round(s)` : `NOT RELEASED: ${r.reason}`);
       process.exit(r.ok ? 0 : 1);
       break;
     }

@@ -255,3 +255,44 @@ export async function relay(chain, { project, version, stageId, artifactUrl, run
   });
   return { confirmed: true, result };
 }
+
+// Answers from the worker that can pass on their own. The contract uses the same list.
+const RETRYABLE = ['pending', 'upload_failed', 'artifact_fetch_failed', 'publish_failed', 'post_check_failed', 'stage_fetch_failed',
+  'outlayer_call_failed', 'unreadable_answer'];
+
+/**
+ * Hand a release to OutLayer through the contract and keep going until it is Released, the worker
+ * gives a final answer, or time runs out. The contract already asks again by itself a few times
+ * (it is limited by gas); this goes on from there. Asking again is safe: the worker confirms an
+ * existing version and never publishes twice.
+ */
+export async function handoff(chain, { project, version, artifactUrl, maxMinutes = 30, pollMs = 10000, deposit = '0.08', say = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now }) {
+  const deadline = now() + maxMinutes * 60000;
+  let rounds = 0;
+  while (now() < deadline) {
+    const release = await chain.view('get_release', { project_id: project, version });
+    if (!release) return { ok: false, reason: 'this version was never proposed' };
+    if (release.status === 'Released') return { ok: true, rounds };
+    if (release.status !== 'Executing') return { ok: false, reason: `the release is ${release.status}, not Executing` };
+    if (await chain.view('get_handoff', { project_id: project, version })) {
+      await sleep(pollMs); // a chain of attempts is running; its answer arrives within about four minutes
+      continue;
+    }
+    rounds++;
+    const res = await chain.callRaw('request_publish', { project_id: project, version, artifact_url: artifactUrl }, {
+      deposit: BigInt(parseNearAmount(deposit)),
+      gas: 300_000_000_000_000n,
+    });
+    const tx = res.transaction?.hash || res.transaction_outcome?.id;
+    say(`round ${rounds}: request_publish ${tx}`);
+    // Wait for this chain to end.
+    while (now() < deadline && (await chain.view('get_handoff', { project_id: project, version }))) await sleep(pollMs);
+    const after = await chain.view('get_release', { project_id: project, version });
+    if (after?.status === 'Released') return { ok: true, rounds };
+    const events = await chain.events(tx, chain.accountId).catch(() => []);
+    const last = [...events].reverse().find((e) => e.event === 'publish_failed');
+    say(`round ${rounds} ended: ${last ? last.data.error : 'no answer'}`);
+    if (last && !RETRYABLE.includes(last.data.error)) return { ok: false, reason: `final answer from the worker: ${last.data.error}${last.data.detail ? ' (' + last.data.detail + ')' : ''}`, rounds };
+  }
+  return { ok: false, reason: `not released after ${maxMinutes} minutes`, rounds };
+}
